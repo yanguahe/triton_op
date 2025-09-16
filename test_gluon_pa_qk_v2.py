@@ -165,7 +165,6 @@ def gemm_qk_v2(
     qk_stride2,
     qk_stride3,
     qk_stride4,
-    qk_stride5,
     QUERY_GRP_SZ: gl.constexpr,
     SEQ_PARTITION_SZ: gl.constexpr,
     PARTITION_KV_BLK_NUM: gl.constexpr,
@@ -179,7 +178,7 @@ def gemm_qk_v2(
     Key parameters:
     - Q: Matrix Q with shape (batch_size, num_kv_heads, QUERY_GRP_SZ, HEAD_SZ).
     - K: Matrix K with shape (batch_size, seq_partition_kv_num, PARTITION_KV_BLK_NUM, num_kv_heads, K_HD_SPLIT_NUM, KV_BLK_SZ, K_SPLIT_HEAD_SZ).
-    - QK: Matrix QK with shape (batch_size, seq_partition_kv_num, PARTITION_KV_BLK_NUM, num_kv_heads, QUERY_GRP_SZ, KV_BLK_SZ).
+    - QK: Matrix QK with shape (batch_size, seq_partition_kv_num, num_kv_heads, QUERY_GRP_SZ, PARTITION_KV_BLK_NUM * KV_BLK_SZ).
     - kv_len = seq_partition_kv_num * PARTITION_KV_BLK_NUM * KV_BLK_SZ
     - K_SPLIT_HEAD_SZ = 8
     """
@@ -194,18 +193,18 @@ def gemm_qk_v2(
 
     q_base_offset = batch_id * q_stride0 + kv_head_idx * q_stride1
     k_base_offset = batch_id * k_stride0 + seq_part_idx * k_stride1 + kv_head_idx * k_stride3
-    qk_base_offset = batch_id * qk_stride0 + seq_part_idx * qk_stride1 + kv_head_idx * qk_stride3
+    qk_base_offset = batch_id * qk_stride0 + seq_part_idx * qk_stride1 + kv_head_idx * qk_stride2
     # q_ptr = q_ptr + q_base_offset
     # k_ptr = k_ptr + k_base_offset
     # qk_ptr = qk_ptr + qk_base_offset
 
-    # 1 x QUERY_GRP_SZ x HEAD_SZ
-    # 1 x 8(mdim) x 128(kdim)
+    # QUERY_GRP_SZ x HEAD_SZ
+    # 8(mdim) x 128(kdim)
     blocked_q: gl.constexpr = gl.BlockedLayout(
-        size_per_thread =[1, 1, 4],
-        threads_per_warp=[1, 8, 8],
-        warps_per_cta   =[1, 1, 4],
-        order           =[2, 1, 0],
+        size_per_thread =[1, 4],
+        threads_per_warp=[8, 8],
+        warps_per_cta   =[1, 4],
+        order           =[1, 0],
     )
     # PARTITION_KV_BLK_NUM x K_HD_SPLIT_NUM x KV_BLK_SZ x K_SPLIT_HEAD_SZ
     # 16 x 16 x 16 x 8
@@ -215,19 +214,11 @@ def gemm_qk_v2(
         warps_per_cta   =[4, 1, 1, 1],
         order           =[3, 2, 1, 0],
     )
-    # PARTITION_KV_BLK_NUM x HEAD_SZ x KV_BLK_SZ
-    # 16 x 128(kdim) x 16(ndim)
-    blocked_kt: gl.constexpr = gl.BlockedLayout(
-        size_per_thread =[4, 4, 8],
-        threads_per_warp=[1, 32, 2],
-        warps_per_cta   =[4, 1, 1],
-        order           =[2, 1, 0],
-    )
 
     # transposed: indicates the result tensor is transposed so that each thread holds consecutive elements
     # in the same row instead of column, which is good for chained dot and global write.
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[4, 1, 1]
+        version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[1, 4]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
@@ -236,58 +227,54 @@ def gemm_qk_v2(
         operand_index=1, parent=mfma_layout, k_width=16
     )
 
-    # q_dim_0_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, blocked_q))
-    q_dim_1_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, blocked_q))
-    q_dim_2_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, blocked_q))
+    # q_dim_1_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, blocked_q))
+    # q_dim_2_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, blocked_q))
+    q_dim_0_layout: gl.constexpr = gl.SliceLayout(1, blocked_q)
+    q_dim_1_layout: gl.constexpr = gl.SliceLayout(0, blocked_q)
 
     k_dim_0_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k)))
     k_dim_1_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k)))
     k_dim_2_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, blocked_k)))
     k_dim_3_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, blocked_k)))
 
-    kt_dim_0_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, blocked_kt))
-    kt_dim_1_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, blocked_kt))
-    kt_dim_2_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, blocked_kt))
-
-    # offs_q_dim0 = gl.arange(0, 1, layout=q_dim_0_layout)
-    offs_q_dim1 = gl.arange(0, QUERY_GRP_SZ, layout=q_dim_1_layout)
-    offs_q_dim2 = gl.arange(0, HEAD_SZ, layout=q_dim_2_layout)
+    offs_q_dim0 = gl.arange(0, QUERY_GRP_SZ, layout=q_dim_0_layout)
+    offs_q_dim1 = gl.arange(0, HEAD_SZ, layout=q_dim_1_layout)
 
     offs_k_dim0 = gl.arange(0, PARTITION_KV_BLK_NUM, layout=k_dim_0_layout)
     offs_k_dim1 = gl.arange(0, K_HD_SPLIT_NUM, layout=k_dim_1_layout)
     offs_k_dim2 = gl.arange(0, KV_BLK_SZ, layout=k_dim_2_layout)
     offs_k_dim3 = gl.arange(0, K_SPLIT_HEAD_SZ, layout=k_dim_3_layout)
 
-    offs_kt_dim0 = gl.arange(0, PARTITION_KV_BLK_NUM, layout=kt_dim_0_layout)
-    offs_kt_dim1 = gl.arange(0, HEAD_SZ, layout=kt_dim_1_layout)
-    offs_kt_dim2 = gl.arange(0, KV_BLK_SZ, layout=kt_dim_2_layout)
-
-    # offs_q = offs_q_dim0[:, None, None] * 0 + offs_q_dim1[None, :, None] * q_stride2 + offs_q_dim2[None, None, :] * q_stride3
-    offs_q = q_base_offset + offs_q_dim1[None, :, None] * q_stride2 + offs_q_dim2[None, None, :] * q_stride3
+    offs_q = q_base_offset + offs_q_dim0[:, None] * q_stride2 + offs_q_dim1[None, :] * q_stride3
     offs_k = k_base_offset + offs_k_dim0[:, None, None, None] * k_stride2 + offs_k_dim1[None, :, None, None] * k_stride4 + offs_k_dim2[None, None, :, None] * k_stride5 + offs_k_dim3[None, None, None, :] * k_stride6
-    kt_stride0 = HEAD_SZ * KV_BLK_SZ
-    kt_stride1 = KV_BLK_SZ
-    kt_stride2 = 1
-    offs_kt = offs_kt_dim0[:, None, None] * kt_stride0 + offs_kt_dim1[None, :, None] * kt_stride1 + offs_kt_dim2[None, None, :] * kt_stride2
 
     q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=offs_q)
     k = gl.amd.cdna3.buffer_load(ptr=k_ptr, offsets=offs_k)
-    q_broadcasted = tl.broadcast_to(q, PARTITION_KV_BLK_NUM, QUERY_GRP_SZ, HEAD_SZ)
-    # (PARTITION_KV_BLK_NUM, K_HD_SPLIT_NUM, KV_BLK_SZ, K_SPLIT_HEAD_SZ) --> (PARTITION_KV_BLK_NUM, K_HD_SPLIT_NUM, K_SPLIT_HEAD_SZ, KV_BLK_SZ)
-    kt_temp = tl.permute(k, [0, 1, 3, 2])
-    kt = tl.reshape(kt_temp, [PARTITION_KV_BLK_NUM, HEAD_SZ, KV_BLK_SZ])
-    # kt = gl.amd.cdna3.buffer_load(ptr=kt_temp, offsets=offs_kt)
+    # q_broadcasted = tl.broadcast_to(q, PARTITION_KV_BLK_NUM, QUERY_GRP_SZ, HEAD_SZ)
+    # # (PARTITION_KV_BLK_NUM, K_HD_SPLIT_NUM, KV_BLK_SZ, K_SPLIT_HEAD_SZ) --> (PARTITION_KV_BLK_NUM, K_HD_SPLIT_NUM, K_SPLIT_HEAD_SZ, KV_BLK_SZ)
+    # kt_temp = gl.permute(k, [0, 1, 3, 2])
+    # kt = gl.reshape(kt_temp, [PARTITION_KV_BLK_NUM, HEAD_SZ, KV_BLK_SZ])
 
-    accumulator = gl.zeros((PARTITION_KV_BLK_NUM, QUERY_GRP_SZ, KV_BLK_SZ), dtype=gl.float32, layout=mfma_layout)
-    q1 = gl.convert_layout(q_broadcasted, layout=dot_a_layout)
+    # (PARTITION_KV_BLK_NUM, K_HD_SPLIT_NUM, KV_BLK_SZ, K_SPLIT_HEAD_SZ) --> (K_HD_SPLIT_NUM, K_SPLIT_HEAD_SZ, PARTITION_KV_BLK_NUM, KV_BLK_SZ)
+    kt_temp = gl.permute(k, [1, 3, 0, 2])
+    kt = gl.reshape(kt_temp, [HEAD_SZ, PARTITION_KV_BLK_NUM * KV_BLK_SZ])
+
+    # accumulator = gl.zeros((PARTITION_KV_BLK_NUM, QUERY_GRP_SZ, KV_BLK_SZ), dtype=gl.float32, layout=mfma_layout)
+    accumulator = gl.zeros((QUERY_GRP_SZ, PARTITION_KV_BLK_NUM * KV_BLK_SZ), dtype=gl.float32, layout=mfma_layout)
+    q1 = gl.convert_layout(q, layout=dot_a_layout)
     k1 = gl.convert_layout(kt, layout=dot_b_layout)
+    # (QUERY_GRP_SZ, PARTITION_KV_BLK_NUM * KV_BLK_SZ)
     accumulator = gl.amd.cdna3.mfma(q1, k1, accumulator)
 
     qk = accumulator.to(q_ptr.dtype.element_ty)
-    offs_qk_dim0 = gl.arange(0, PARTITION_KV_BLK_NUM, layout=gl.SliceLayout(1, gl.SliceLayout(2, mfma_layout)))
-    offs_qk_dim1 = gl.arange(0, QUERY_GRP_SZ, layout=gl.SliceLayout(0, gl.SliceLayout(2, mfma_layout)))
-    offs_qk_dim2 = gl.arange(0, KV_BLK_SZ, layout=gl.SliceLayout(0, gl.SliceLayout(1, mfma_layout)))
-    offs_qk = qk_base_offset + offs_qk_dim0[:, None, None] * qk_stride2 + offs_qk_dim1[None, :, None] * qk_stride4 + offs_qk_dim2[None, None, :] * qk_stride5
+    # offs_qk_dim0 = gl.arange(0, PARTITION_KV_BLK_NUM, layout=gl.SliceLayout(1, gl.SliceLayout(2, mfma_layout)))
+    # offs_qk_dim1 = gl.arange(0, QUERY_GRP_SZ, layout=gl.SliceLayout(0, gl.SliceLayout(2, mfma_layout)))
+    # offs_qk_dim2 = gl.arange(0, KV_BLK_SZ, layout=gl.SliceLayout(0, gl.SliceLayout(1, mfma_layout)))
+    # offs_qk = qk_base_offset + offs_qk_dim0[:, None, None] * qk_stride2 + offs_qk_dim1[None, :, None] * qk_stride4 + offs_qk_dim2[None, None, :] * qk_stride5
+    offs_qk_dim0 = gl.arange(0, QUERY_GRP_SZ, layout=gl.SliceLayout(1, mfma_layout))
+    offs_qk_dim1 = gl.arange(0, PARTITION_KV_BLK_NUM * KV_BLK_SZ, layout=gl.SliceLayout(0, mfma_layout))
+    offs_qk = qk_base_offset + offs_qk_dim0[:, None] * qk_stride3 + offs_qk_dim1[None, :] * qk_stride4
+
     # qk_mask = seq_start_idx + offs_qk_dim0[:, None, None] * KV_BLK_SZ < seq_len
     # gl.amd.cdna3.buffer_store(stored_value=qk, ptr=qk_ptr, offsets=offs_qk, mask=qk_mask)
     gl.amd.cdna3.buffer_store(stored_value=qk, ptr=qk_ptr, offsets=offs_qk)
@@ -394,8 +381,8 @@ def run_gemm_qk(q, k, dtype):
     _, seq_partition_kv_num, PARTITION_KV_BLK_NUM, _, K_HD_SPLIT_NUM, KV_BLK_SZ, K_SPLIT_HEAD_SZ = k.shape
     kv_len = seq_partition_kv_num * PARTITION_KV_BLK_NUM * KV_BLK_SZ
     HEAD_SZ = K_HD_SPLIT_NUM * K_SPLIT_HEAD_SZ
-    # qk = torch.randn((batch_size, seq_partition_kv_num, PARTITION_KV_BLK_NUM, num_kv_heads, QUERY_GRP_SZ, KV_BLK_SZ), device="cuda", dtype=dtype)
-    qk = torch.empty((batch_size, seq_partition_kv_num, PARTITION_KV_BLK_NUM, num_kv_heads, QUERY_GRP_SZ, KV_BLK_SZ), device="cuda", dtype=dtype)
+    # qk = torch.randn((batch_size, seq_partition_kv_num, num_kv_heads, QUERY_GRP_SZ, PARTITION_KV_BLK_NUM * KV_BLK_SZ), device="cuda", dtype=dtype)
+    qk = torch.empty((batch_size, seq_partition_kv_num, num_kv_heads, QUERY_GRP_SZ, PARTITION_KV_BLK_NUM * KV_BLK_SZ), device="cuda", dtype=dtype)
     q = q.reshape(batch_size, num_kv_heads, QUERY_GRP_SZ, HEAD_SZ)
     # print(f"q.stride()={q.stride()}")
     # print(f"k.stride()={k.stride()}")
@@ -422,9 +409,12 @@ def run_gemm_qk(q, k, dtype):
         qk.stride(2),
         qk.stride(3),
         qk.stride(4),
-        qk.stride(5),
     )
+    qk = qk.reshape(batch_size, seq_partition_kv_num, num_kv_heads, QUERY_GRP_SZ, PARTITION_KV_BLK_NUM, KV_BLK_SZ)
+    # (batch_size, seq_partition_kv_num, PARTITION_KV_BLK_NUM, num_kv_heads, QUERY_GRP_SZ, KV_BLK_SZ)
+    qk = qk.transpose(-3, -2).transpose(2, 3)
     return qk
+
 
 @perftest()
 def run_gemm_qk_triton(q, k, dtype):
@@ -529,6 +519,7 @@ def test_gemm_qk():
     k = torch.randn((batch_size, seq_partition_kv_num, PARTITION_KV_BLK_NUM, num_kv_heads, K_HD_SPLIT_NUM, KV_BLK_SZ, K_SPLIT_HEAD_SZ), device="cuda", dtype=dtype)
 
     qk_gn, avg_t_us_gn = run_gemm_qk(q, k, dtype)
+
     qk_tn, avg_t_us_tn = run_gemm_qk_triton(q, k, dtype)
 
     q = q.to(torch.float32)
