@@ -134,7 +134,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # in the same row instead of column, which is good for chained dot and global write.
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         # version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[4, 1]
-        version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[1, 4]
+        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
     )
     qk_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=qk_mfma_layout, k_width=16
@@ -147,10 +147,10 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[1, 4]
     )
     pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=pv_mfma_layout, k_width=16
+        operand_index=0, parent=pv_mfma_layout, k_width=4
     )
     pv_rhs_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=pv_mfma_layout, k_width=16
+        operand_index=1, parent=pv_mfma_layout, k_width=4
     )
 
     # # blocked_q dim1
@@ -177,8 +177,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     blk_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=blk_layout)
     contiguous_kv_elems_offs = gl.arange(0, CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=contiguous_kv_elems_layout)
 
+    kv_blk_start = seq_part_idx * MAX_NUM_KV_BLKS
     qk_row_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
-    qk_col_offs = gl.arange(0, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, qk_mfma_layout))
+    qk_col_offs = kv_blk_start + gl.arange(0, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, qk_mfma_layout))
 
     # load alibi slopes[QUERY_GRP_SZ_POW2]
     if alibi_slopes is None:
@@ -194,7 +195,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # load all kv blocks in one time
     blk_ids = gl.arange(0, MAX_NUM_KV_BLKS, layout=blk_id_layout)
     masked_blk_ids = gl.where(blk_ids < num_kv_blks, blk_ids, 0)
-    kv_blk_start = seq_part_idx * MAX_NUM_KV_BLKS
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
     # kv_blk_nums = gl.load(blk_tables_start_ptr + kv_blk_start + masked_blk_ids)
     kv_blk_nums = gl.amd.cdna3.buffer_load(ptr=blk_tables_start_ptr + kv_blk_start, offsets=masked_blk_ids)
@@ -209,6 +209,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # # q = gl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
     # q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs, mask=q_mask)
     # q = (q * scale).to(compute_type)
+
     # load q[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     q_offs = (
         seq_idx * stride_q_s
@@ -218,6 +219,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     q_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
     # q = gl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
     q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs, mask=q_mask)
+    # q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs)
     q = (q * scale).to(compute_type)
 
     # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
@@ -245,9 +247,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     k = k_0.to(gl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
     k = k.to(compute_type)
     # (MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD) --> (K_HEAD_SZ_POW2_SPLIT, CONTIGUOUS_KV_ELEMS_16B_LOAD, MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2)
-    k = tl.permute(k, [1, 3, 0, 2])
+    kt_temp = tl.permute(k, [1, 3, 0, 2])
     # k[HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
-    k = tl.reshape(k, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
+    kt = tl.reshape(kt_temp, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
     # # (MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD) --> (MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, CONTIGUOUS_KV_ELEMS_16B_LOAD, KV_BLK_SZ_POW2)
     # kt_temp = tl.permute(k, [0, 1, 3, 2])
     # # k[MAX_NUM_KV_BLKS, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
@@ -259,7 +261,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # qk = gl.dot(q, k, out_dtype=gl.float32)
     accumulator = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2), dtype=gl.float32, layout=qk_mfma_layout)
     qc = gl.convert_layout(q, layout=qk_lhs_layout)
-    kc = gl.convert_layout(k, layout=qk_rhs_layout)
+    kc = gl.convert_layout(kt, layout=qk_rhs_layout)
     qk = gl.amd.cdna3.mfma(qc, kc, accumulator)
     # qk = qk.to(compute_type)
 
@@ -287,6 +289,40 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     exp_sum = gl.sum(p, axis=1)
     p = p.to(compute_type)
 
+    m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
+    m_l_offs = (
+        seq_idx * stride_max_logits_s
+        + kv_head_idx * stride_max_logits_nh
+        + seq_part_idx * stride_max_logits_p
+        + m_l_base_offs
+    )
+    m_l_grp_mask = m_l_base_offs < QUERY_GRP_SZ
+    gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
+    gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
+
+
+    # # shape_info = (num_seqs, num_kv_heads, max_num_partitions, query_grp_sz)
+    # # stride_logits_s,
+    # # stride_logits_nh,
+    # # stride_logits_p,
+    # # stride_logits_g,
+    # o_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
+    # o_head_sz_offs = gl.arange(0, 256, layout=gl.SliceLayout(0, qk_mfma_layout))
+    # o_mask = (o_grp_offs[:, None] < QUERY_GRP_SZ) & (kv_blk_start + o_head_sz_offs[None, :] < seq_len)
+    # logits_offs = seq_idx * stride_logits_s
+    # logits_offs += kv_head_idx * stride_logits_nh
+    # logits_offs += (
+    #     seq_part_idx * stride_logits_p
+    #     + o_grp_offs[:, None] * stride_logits_g
+    #     + o_head_sz_offs[None, :]
+    # )
+    # gl.amd.cdna3.buffer_store(stored_value=p, ptr=logits_ptr, offsets=logits_offs, mask=o_mask)
+    # # gl.amd.cdna3.buffer_store(stored_value=qk.to(compute_type), ptr=logits_ptr, offsets=logits_offs, mask=o_mask)
+    # # gl.amd.cdna3.buffer_store(stored_value=qk.to(compute_type), ptr=logits_ptr, offsets=logits_offs)
+
+
+
+
     # # v_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     # v_blk_offs = (
     #     kv_blk_nums[:, None, None] * stride_v_b
@@ -311,9 +347,18 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
     v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout)))
     v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_v_layout)))
+
+    # # load all kv blocks in one time
+    # blk_ids = gl.arange(0, MAX_NUM_KV_BLKS, layout=blk_id_layout)
+    # masked_blk_ids = gl.where(blk_ids < num_kv_blks, blk_ids, 0)
+    # blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
+    # # kv_blk_nums = gl.load(blk_tables_start_ptr + kv_blk_start + masked_blk_ids)
+    # kv_blk_nums = gl.amd.cdna3.buffer_load(ptr=blk_tables_start_ptr + kv_blk_start, offsets=masked_blk_ids)
+
+    kv_blk_nums2 = gl.convert_layout(kv_blk_nums, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
     # v_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     v_blk_offs = (
-        v_dim0_offs[:, None, None] * stride_v_b
+        kv_blk_nums2[:, None, None] * stride_v_b
         + kv_head_idx * stride_v_nh
         + v_dim1_offs[None, :, None] * stride_v_hz
         + v_dim2_offs[None, None, :]
@@ -328,8 +373,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # v[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     # v_0 = gl.load(v_cache_ptr + v_blk_offs)
     v_0 = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs)
-    v = v_0.to(gl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
-    v = v.to(compute_type)
+    # v = v_0.to(gl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
+    v = v_0.to(compute_type)
     # [MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2] --> [MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2, HEAD_SZ_POW2]
     v = gl.permute(v, [0, 2, 1])
     # v[MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2]
@@ -364,11 +409,10 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     pc = gl.convert_layout(p, layout=pv_lhs_layout)
     vc = gl.convert_layout(v, layout=pv_rhs_layout)
     acc = gl.amd.cdna3.mfma(pc, vc, accumulator2)
-    # exp_sum = exp_sum.to(compute_type)
-    # exp_sum = exp_sum.to(gl.float32)
-    # exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
-    exp_sum_broadcasted = tl.broadcast_to(exp_sum[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
-    exp_sum = gl.convert_layout(exp_sum_broadcasted, layout=pv_mfma_layout)
+    exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
+    exp_sum = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+    # exp_sum = tl.broadcast_to(exp_sum[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+    # exp_sum = gl.convert_layout(exp_sum, layout=pv_mfma_layout)
     acc = acc / exp_sum
     acc = acc.to(compute_type)
 
@@ -1172,9 +1216,11 @@ def paged_attn_decode_v2(
     else:
         grid = (num_seqs, num_kv_heads, max_num_partitions)
         shape_info = (num_seqs, num_kv_heads, max_num_partitions, query_grp_sz)
-        max_logits = torch.empty(shape_info, dtype=torch.float32, device=output.device)
-        exp_sums = torch.empty(shape_info, dtype=torch.float32, device=output.device)
-        tmp_output = torch.empty(
+        max_logits = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
+        exp_sums = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
+        # tmp_output = torch.empty(
+        tmp_output = torch.zeros(
+            # (*shape_info, 256), dtype=output.dtype, device=output.device
             *shape_info, head_sz, dtype=output.dtype, device=output.device
         )
         if query_grp_sz <= 16:
@@ -1182,6 +1228,8 @@ def paged_attn_decode_v2(
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
 
+        compute_type2 = gl.bfloat16
+        print(f"grid={grid}")
         print(f"query.shape={query.shape}")
         print(f"key_cache.shape={key_cache.shape}")
         print(f"value_cache.shape={value_cache.shape}")
@@ -1193,6 +1241,8 @@ def paged_attn_decode_v2(
         print(f"output.dtype={output.dtype}")
         print(f"block_tables.dtype={block_tables.dtype}")
         input_config = dict(
+            scale=scale,
+            max_num_partitions=max_num_partitions,
             kv_type=compute_type,
             compute_type=compute_type,
             HEAD_SZ=head_sz,
@@ -1202,6 +1252,10 @@ def paged_attn_decode_v2(
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            stride_logits_s=tmp_output.stride(0),
+            stride_logits_nh=tmp_output.stride(1),
+            stride_logits_p=tmp_output.stride(2),
+            stride_logits_g=tmp_output.stride(3),
         )
         print(input_config)
 
@@ -1236,8 +1290,8 @@ def paged_attn_decode_v2(
             value_cache.stride(1),
             value_cache.stride(2),
             block_tables.stride(0),
-            kv_type=compute_type,
-            compute_type=compute_type,
+            kv_type=compute_type2,
+            compute_type=compute_type2,
             HEAD_SZ=head_sz,
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
@@ -1272,9 +1326,13 @@ def paged_attn_decode_v2(
             MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
         )
         # reduce_time = 0
+        # print(f"gluon:\n{tmp_output[0]}")
 
-        return {'triton_decode': decode_time, 
-                'triton_reduce': reduce_time, 
+        return {'triton_decode': decode_time,
+                'triton_reduce': reduce_time,
+                'tmp_output': tmp_output,
+                'exp_sums': exp_sums,
+                'max_logits': max_logits,
                 'triton': decode_time + reduce_time}
 
 

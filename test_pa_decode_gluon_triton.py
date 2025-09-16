@@ -34,6 +34,7 @@ torch_to_tl_dtype = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
 
 
 def setup_seed(seed):
+    random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
@@ -51,7 +52,7 @@ def compare_arrays(arr1: np.ndarray, arr2: np.ndarray,
         arr2: Second input array (float32)
         k: Number of top differences to return
         thresholds: List of thresholds for difference magnitude analysis
-        
+
     Returns:
         Dictionary containing:
         - top_k_diff: Top k absolute differences with their positions
@@ -426,8 +427,23 @@ def test_paged_attention(
         alibi_slopes=None,
     )
 
+    def compare_tensor_in_dict(res_dict, ref_res_dict, key):
+        res = res_dict[key]
+        ref_res = ref_res_dict[key]
+        res_md5 = hashlib.md5(res.view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+        ref_res_md5 = hashlib.md5(ref_res.view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+        print(f"******************compare {key}******************")
+        compare_arrays(res.to(torch.float32).detach().cpu().numpy(), ref_res.to(torch.float32).detach().cpu().numpy())
+        print(f"res_md5={res_md5}")
+        print(f"ref_res_md5={ref_res_md5}")
+
+
     compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), hip_output.to(torch.float32).detach().cpu().numpy())
     compare_arrays(gluon_output.to(torch.float32).detach().cpu().numpy(), triton_output.to(torch.float32).detach().cpu().numpy())
+    compare_tensor_in_dict(gluon_time, triton_time, "tmp_output")
+    compare_tensor_in_dict(gluon_time, triton_time, "exp_sums")
+    compare_tensor_in_dict(gluon_time, triton_time, "max_logits")
+
     hip_output_md5 = hashlib.md5(hip_output.view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
     triton_output_md5 = hashlib.md5(triton_output.view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
     gluon_output_md5 = hashlib.md5(gluon_output.view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
@@ -436,7 +452,8 @@ def test_paged_attention(
     print(f"triton_output_md5={triton_output_md5}")
     print(f"gluon_output_md5={gluon_output_md5}")
 
-    checkAllclose(hip_output, triton_output)
+    checkAllclose(triton_output, hip_output)
+    checkAllclose(gluon_output, hip_output)
     print("\033[92mPASSED\033[0m")
 
     return {**time_hip, **triton_time}
@@ -464,12 +481,12 @@ for (num_seq, seq_len, num_heads, dtype) in itertools.product(
         num_seq, num_heads[0], num_heads[1], HEAD_SIZE, KV_BLOCK_SIZE, seq_len, 
         num_blocks, dtype, dtype, torch_to_tl_dtype[dtype], dtype
     )
-    df.append(ret)
-df = pd.DataFrame(df)
-logger.info(f"summary:\n{df}")
+#     df.append(ret)
+# df = pd.DataFrame(df)
+# logger.info(f"summary:\n{df}")
 
-cur_dir = os.path.dirname(os.path.abspath(__file__))
-result_dir = os.path.join(os.path.dirname(cur_dir), "result")
-if os.path.exists(result_dir) == False:
-    os.mkdir(result_dir)
-df.to_csv(os.path.join(result_dir, "pa_summary.csv"), index=False)
+# cur_dir = os.path.dirname(os.path.abspath(__file__))
+# result_dir = os.path.join(os.path.dirname(cur_dir), "result")
+# if os.path.exists(result_dir) == False:
+#     os.mkdir(result_dir)
+# df.to_csv(os.path.join(result_dir, "pa_summary.csv"), index=False)

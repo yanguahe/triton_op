@@ -85,8 +85,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     # import pdb
     # pdb.set_trace()
 
-    if 1:
-    # if 0:
+    # if 1:
+    if 0:
         with open(ttgir_file_path, 'r') as f:
             ttgir_content = f.read()
 
@@ -807,9 +807,11 @@ def paged_attn_decode_v2(
     else:
         grid = (num_seqs, num_kv_heads, max_num_partitions)
         shape_info = (num_seqs, num_kv_heads, max_num_partitions, query_grp_sz)
-        max_logits = torch.empty(shape_info, dtype=torch.float32, device=output.device)
-        exp_sums = torch.empty(shape_info, dtype=torch.float32, device=output.device)
-        tmp_output = torch.empty(
+        max_logits = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
+        exp_sums = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
+        # tmp_output = torch.empty(
+        tmp_output = torch.zeros(
+            # (*shape_info, 256), dtype=output.dtype, device=output.device
             *shape_info, head_sz, dtype=output.dtype, device=output.device
         )
         if query_grp_sz <= 16:
@@ -907,9 +909,13 @@ def paged_attn_decode_v2(
             MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
         )
         # reduce_time = 0
+        # print(f"triton:\n{tmp_output[0]}")
 
-        return {'triton_decode': decode_time, 
-                'triton_reduce': reduce_time, 
+        return {'triton_decode': decode_time,
+                'triton_reduce': reduce_time,
+                'tmp_output': tmp_output,
+                'exp_sums': exp_sums,
+                'max_logits': max_logits,
                 'triton': decode_time + reduce_time}
 
 
@@ -2029,8 +2035,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     max_logit_new = tl.max(qk, axis=1)
     # p[QUERY_GRP_SZ_POW2, max_num_kv_blks * KV_BLK_SZ_POW2]
     p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
-    p = p.to(compute_type)
     exp_sum = tl.sum(p, axis=1)
+    p = p.to(compute_type)
 
     # v_blk_offs[max_num_kv_blks, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     v_blk_offs = (
@@ -2063,9 +2069,26 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     tl.store(max_logits_ptr + max_logits_offs, max_logit_new, mask=m_grp_mask)
     tl.store(exp_sums_ptr + max_logits_offs, exp_sum, mask=m_grp_mask)
 
+
+    # o_row_offs = tl.arange(0, QUERY_GRP_SZ_POW2)
+    # o_col_offs = tl.arange(0, 256)
+    # o_mask = (o_row_offs[:, None] < QUERY_GRP_SZ) & (kv_blk_start + o_col_offs[None, :] < seq_len)
+    # logits_offs = seq_idx * stride_logits_s
+    # logits_offs += kv_head_idx * stride_logits_nh
+    # logits_offs += (
+    #     seq_part_idx * stride_logits_p
+    #     + o_row_offs[:, None] * stride_logits_g
+    #     + o_col_offs[None, :]
+    # )
+    # tl.store(logits_ptr + logits_offs, p, mask=o_mask)
+    # # tl.store(logits_ptr + logits_offs, qk.to(compute_type), mask=o_mask)
+    # # tl.store(logits_ptr + logits_offs, qk.to(compute_type))
+
+
     # acc[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     acc = tl.dot(p, v, out_dtype=tl.float32)
     acc = acc / exp_sum[:, None]
+    acc = acc.to(compute_type)
 
     # end up computation
     logits_offs = seq_idx * stride_logits_s

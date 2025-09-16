@@ -134,8 +134,8 @@ def compare_arrays(arr1: np.ndarray, arr2: np.ndarray,
 
 def get_autotune_config():
     sizes = [
-        # {'QUERY_GRP_SZ': 16, 'SEQ_PARTITION_SZ': 256, 'PARTITION_KV_BLK_NUM': 16, 'K_HD_SPLIT_NUM': 16, 'K_SPLIT_HEAD_SZ': 8, 'KV_BLK_SZ': 16, 'HEAD_SZ': 128},
-        {'QUERY_GRP_SZ': 8, 'SEQ_PARTITION_SZ': 256, 'PARTITION_KV_BLK_NUM': 16, 'K_HD_SPLIT_NUM': 16, 'K_SPLIT_HEAD_SZ': 8, 'KV_BLK_SZ': 16, 'HEAD_SZ': 128},
+        # {'QUERY_GRP_SZ': 8, 'SEQ_PARTITION_SZ': 256, 'PARTITION_KV_BLK_NUM': 16, 'K_HD_SPLIT_NUM': 16, 'K_SPLIT_HEAD_SZ': 8, 'KV_BLK_SZ': 16, 'HEAD_SZ': 128},
+        {'QUERY_GRP_SZ': 16, 'SEQ_PARTITION_SZ': 256, 'PARTITION_KV_BLK_NUM': 16, 'K_HD_SPLIT_NUM': 16, 'K_SPLIT_HEAD_SZ': 8, 'KV_BLK_SZ': 16, 'HEAD_SZ': 128},
     ]
     return [triton.Config(s) for s in sizes]
 
@@ -201,7 +201,7 @@ def gemm_qk_v2(
     # QUERY_GRP_SZ x HEAD_SZ
     # 8(mdim) x 128(kdim)
     blocked_q: gl.constexpr = gl.BlockedLayout(
-        size_per_thread =[1, 4],
+        size_per_thread =[2, 4],
         threads_per_warp=[8, 8],
         warps_per_cta   =[1, 4],
         order           =[1, 0],
@@ -266,7 +266,8 @@ def gemm_qk_v2(
     # (QUERY_GRP_SZ, PARTITION_KV_BLK_NUM * KV_BLK_SZ)
     accumulator = gl.amd.cdna3.mfma(q1, k1, accumulator)
 
-    qk = accumulator.to(q_ptr.dtype.element_ty)
+    # qk = accumulator.to(q_ptr.dtype.element_ty)
+    qk = accumulator.to(gl.bfloat16)
     # offs_qk_dim0 = gl.arange(0, PARTITION_KV_BLK_NUM, layout=gl.SliceLayout(1, gl.SliceLayout(2, mfma_layout)))
     # offs_qk_dim1 = gl.arange(0, QUERY_GRP_SZ, layout=gl.SliceLayout(0, gl.SliceLayout(2, mfma_layout)))
     # offs_qk_dim2 = gl.arange(0, KV_BLK_SZ, layout=gl.SliceLayout(0, gl.SliceLayout(1, mfma_layout)))
@@ -492,8 +493,8 @@ def test_gemm_qk():
     # - kv_len = seq_partition_kv_num * PARTITION_KV_BLK_NUM * KV_BLK_SZ
     # - K_SPLIT_HEAD_SZ = 8
     q_shape_list = [
-        [32, 1, 8, 16, 8],
-        # [80, 1, 16, 16, 8],
+        # [32, 1, 8, 16, 8],
+        [80, 1, 16, 16, 8],
         # [80, 3, 16, 16, 8],
     ]
     k_shape_list = [
