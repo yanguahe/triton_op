@@ -125,6 +125,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         except Exception as e:
             print(f"Compilation failed: {e}")
     else:
+        # print(f"@@@@@ invoke _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk...")
         _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk[grid](
             exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
             max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -163,6 +164,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             KV_BLK_SZ=KV_BLK_SZ,
             KV_BLK_SZ_POW2=KV_BLK_SZ_POW2,
             SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
+            CONTIGUOUS_KV_ELEMS_16B_LOAD=k_cache_ptr.shape[-1]
         )
 
 @perftest()
@@ -245,7 +247,7 @@ def paged_attention_decode(
     # )
     use_v1 = False
     print("***************************************************")
-    print(f"k_scale.numel()={k_scale.numel()}")
+    print(f"k_scale.numel()={k_scale.numel()}, {use_v1=}")
     print("***************************************************")
     if k_scale.numel() > 1:
         if use_v1:
@@ -883,6 +885,7 @@ def paged_attn_decode_v2(
             KV_BLK_SZ_POW2=kv_blk_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
         )
+        print(f"@@@@@ _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper end {decode_time=}...")
         grid = (num_seqs, num_kv_heads, 1)
         _, reduce_time = _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
             grid,
@@ -908,6 +911,7 @@ def paged_attn_decode_v2(
             MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
             MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
         )
+        print(f"@@@@@ _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper end {reduce_time=}...")
         # reduce_time = 0
         # print(f"triton:\n{tmp_output[0]}")
 
@@ -1939,6 +1943,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     KV_BLK_SZ: tl.constexpr,
     KV_BLK_SZ_POW2: tl.constexpr,
     SEQ_PARTITION_SZ: tl.constexpr,
+    CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr
 ):
     """
     #TODO: Add Doc
@@ -1949,7 +1954,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     seq_part_idx = tl.program_id(2)
 
     log2e: tl.constexpr = 1.4426950408889634
-    CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr = 8
+    # CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr = 16
 
     seq_len = tl.load(seq_lens_ptr + seq_idx)
     seq_start_idx = seq_part_idx * SEQ_PARTITION_SZ

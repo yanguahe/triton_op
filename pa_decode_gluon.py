@@ -83,6 +83,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     KV_BLK_SZ: gl.constexpr,
     KV_BLK_SZ_POW2: gl.constexpr,
     SEQ_PARTITION_SZ: gl.constexpr,
+    CONTIGUOUS_KV_ELEMS_16B_LOAD: gl.constexpr
 ):
     """
     #TODO: Add Doc
@@ -93,7 +94,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     seq_part_idx = gl.program_id(2)
 
     log2e: gl.constexpr = 1.4426950408889634
-    CONTIGUOUS_KV_ELEMS_16B_LOAD: gl.constexpr = 8
+    # CONTIGUOUS_KV_ELEMS_16B_LOAD: gl.constexpr = 16
     K_HEAD_SZ_POW2_SPLIT: gl.constexpr = HEAD_SZ_POW2 // CONTIGUOUS_KV_ELEMS_16B_LOAD
 
     seq_len = gl.load(seq_lens_ptr + seq_idx)
@@ -127,23 +128,31 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         warps_per_cta   =[4, 1],
         order           =[1, 0],
     )
-    shared_a_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[1, 0])
+    # shared_a_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[1, 0])
     # MAX_NUM_KV_BLKS x K_HEAD_SZ_POW2_SPLIT x KV_BLK_SZ_POW2 x CONTIGUOUS_KV_ELEMS_16B_LOAD
-    # 16 x 16 x 16 x 8
+    # 16 x 16 x 16 x 8 x fp16   or   16 x 8 x 16 x 16 x fp16
     blocked_k0: gl.constexpr = gl.BlockedLayout(
         size_per_thread =[4, 2, 2, 8],
         threads_per_warp=[1, 8, 8, 1],
         warps_per_cta   =[4, 1, 1, 1],
         order           =[3, 2, 1, 0],
     )
-    blocked_k: gl.constexpr = gl.DistributedLinearLayout( # 128x256
+    blocked_k1: gl.constexpr = gl.DistributedLinearLayout( # fp16
         reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,1,0,0), (0,8,0,0), (4,0,0,0), (8,0,0,0)), # 16 x 8
         lane_bases=((0,0,1,0), (0,0,2,0), (0,0,4,0), (0,0,8,0), (0,2,0,0), (0,4,0,0)), # 64
         warp_bases=((1,0,0,0), (2,0,0,0)), # 4
         block_bases=[], # 8
         shape=[16, 16, 16, 8],
     )
+    blocked_k2: gl.constexpr = gl.DistributedLinearLayout( # fp8
+        reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,0,0,8), (0,4,0,0), (4,0,0,0), (8,0,0,0)), # 16 x 8
+        lane_bases=((0,0,1,0), (0,0,2,0), (0,0,4,0), (0,0,8,0), (0,1,0,0), (0,2,0,0)), # 64
+        warp_bases=((1,0,0,0), (2,0,0,0)), # 4
+        block_bases=[], # 8
+        shape=[16, 8, 16, 16],
+    )
 
+    blocked_k: gl.constexpr = blocked_k1 if CONTIGUOUS_KV_ELEMS_16B_LOAD == 8 else blocked_k2
     # transposed: indicates the result tensor is transposed so that each thread holds consecutive elements
     # in the same row instead of column, which is good for chained dot and global write.
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -158,7 +167,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     )
 
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[1, 4]
+        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
     )
     pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=pv_mfma_layout, k_width=16
@@ -235,7 +244,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs, mask=q_mask)
     # q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs)
     q = (q * scale).to(compute_type)
-    q_shared = gl.allocate_shared_memory(q.dtype, q.shape, shared_a_layout, q)
+    # q_shared = gl.allocate_shared_memory(q.dtype, q.shape, shared_a_layout, q)
 
     # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
     k_blk_offs = (
@@ -275,8 +284,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # qk[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     # qk = gl.dot(q, k, out_dtype=gl.float32)
     accumulator = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2), dtype=gl.float32, layout=qk_mfma_layout)
-    # qc = gl.convert_layout(q, layout=qk_lhs_layout)
-    qc = q_shared.load(qk_lhs_layout)
+    qc = gl.convert_layout(q, layout=qk_lhs_layout)
+    # qc = q_shared.load(qk_lhs_layout)
     kc = gl.convert_layout(kt, layout=qk_rhs_layout)
     qk = gl.amd.cdna3.mfma(qc, kc, accumulator)
     # qk = qk.to(compute_type)
@@ -403,14 +412,14 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # v[MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2]
     v = gl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
 
-    m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
-    m_l_offs = (
-        seq_idx * stride_max_logits_s
-        + kv_head_idx * stride_max_logits_nh
-        + seq_part_idx * stride_max_logits_p
-        + m_l_base_offs
-    )
-    m_l_grp_mask = m_l_base_offs < QUERY_GRP_SZ
+    # m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
+    # m_l_offs = (
+    #     seq_idx * stride_max_logits_s
+    #     + kv_head_idx * stride_max_logits_nh
+    #     + seq_part_idx * stride_max_logits_p
+    #     + m_l_base_offs
+    # )
+    # m_l_grp_mask = m_l_base_offs < QUERY_GRP_SZ
 
     # q_grp_offs2 = tl.arange(0, QUERY_GRP_SZ_POW2)
     # max_logits_offs = (
@@ -422,8 +431,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # m_grp_mask = q_grp_offs2 < QUERY_GRP_SZ
     # tl.store(max_logits_ptr + max_logits_offs, max_logit_new, mask=m_grp_mask)
     # tl.store(exp_sums_ptr + max_logits_offs, exp_sum, mask=m_grp_mask)
-    gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
-    gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
+    # gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
+    # gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
 
     # acc[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     # acc = gl.dot(p, v, out_dtype=gl.float32)
@@ -556,6 +565,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         except Exception as e:
             print(f"Compilation failed: {e}")
     else:
+        # print(f"@@@@@ {logits_ptr.dtype=}, {compute_type=}")
         # _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk[grid](
         _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon[grid](
             exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -595,6 +605,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             KV_BLK_SZ=KV_BLK_SZ,
             KV_BLK_SZ_POW2=KV_BLK_SZ_POW2,
             SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
+            CONTIGUOUS_KV_ELEMS_16B_LOAD=k_cache_ptr.shape[-1]
         )
 
 @perftest()
@@ -1313,8 +1324,8 @@ def paged_attn_decode_v2(
             value_cache.stride(1),
             value_cache.stride(2),
             block_tables.stride(0),
-            kv_type=compute_type2,
-            compute_type=compute_type2,
+            kv_type=compute_type, #compute_type2,
+            compute_type=compute_type, #compute_type2,
             HEAD_SZ=head_sz,
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
