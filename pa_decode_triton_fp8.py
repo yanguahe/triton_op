@@ -34,9 +34,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
     blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
     seq_lens_ptr,       # [num_seqs]
-    scale,
-    k_scale,
-    v_scale,
+    softmax_scale,
+    k_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
+    v_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
     alibi_slopes,
     stride_max_logits_s,
     stride_max_logits_nh,
@@ -55,6 +55,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     stride_v_nh,
     stride_v_hz,
     stride_bt_s,
+    kv_scale_stride0,
+    kv_scale_stride1,
     compute_type: tl.constexpr,
     HEAD_SZ: tl.constexpr,
     HEAD_SZ_POW2: tl.constexpr,
@@ -73,7 +75,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     seq_part_idx = tl.program_id(2)
 
     log2e: tl.constexpr = 1.4426950408889634
-    CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr = 8
+    # CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr = 8
+    CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr = 16
 
     seq_len = tl.load(seq_lens_ptr + seq_idx)
     seq_start_idx = seq_part_idx * SEQ_PARTITION_SZ
@@ -81,7 +84,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
         return
 
     seq_end_idx = tl.minimum(seq_start_idx + SEQ_PARTITION_SZ, seq_len)
-    max_num_kv_blks: tl.constexpr = (SEQ_PARTITION_SZ + KV_BLK_SZ - 1) // KV_BLK_SZ
+    MAX_NUM_KV_BLKS: tl.constexpr = (SEQ_PARTITION_SZ + KV_BLK_SZ - 1) // KV_BLK_SZ
     num_kv_blks = tl.cdiv(seq_end_idx - seq_start_idx, KV_BLK_SZ)
 
     blk_offs = tl.arange(0, KV_BLK_SZ_POW2)
@@ -101,9 +104,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
         )
 
     # load all kv blocks in one time
-    blk_ids = tl.arange(0, max_num_kv_blks)
+    blk_ids = tl.arange(0, MAX_NUM_KV_BLKS)
     masked_blk_ids = tl.where(blk_ids < num_kv_blks, blk_ids, 0)
-    kv_blk_start = seq_part_idx * max_num_kv_blks
+    kv_blk_start = seq_part_idx * MAX_NUM_KV_BLKS
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
     kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_start + masked_blk_ids)
 
@@ -115,9 +118,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     )
     q_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
     q = tl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
-    q = (q * scale).to(compute_type)
 
-    # k_blk_offs[max_num_kv_blks, HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
+    # k_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
     k_blk_offs = (
         kv_blk_nums[:, None, None, None] * stride_k_b
         + kv_head_idx * stride_k_nh
@@ -125,27 +127,62 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
         + blk_offs[None, None, :, None] * CONTIGUOUS_KV_ELEMS_16B_LOAD
         + contiguous_kv_elems_offs[None, None, None, :]
     )
-    # blk_seq_offs[max_num_kv_blks, KV_BLK_SZ_POW2]
-    blk_seq_offs = ((kv_blk_start + blk_ids[:, None]) * KV_BLK_SZ  # blk_ids: [max_num_kv_blks]
+    # blk_seq_offs[MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2]
+    blk_seq_offs = ((kv_blk_start + blk_ids[:, None]) * KV_BLK_SZ  # blk_ids: [MAX_NUM_KV_BLKS]
                     + blk_offs[None, :]) # blk_offs: [KV_BLK_SZ_POW2]
+    # k_mask = (
+    #     (blk_seq_offs[:, None, :, None] < seq_len) &
+    #     (blk_offs[None, None, :, None] < KV_BLK_SZ) &
+    #     (head_sz_div_offs[None, :, None, None] < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD))
+    # )
 
-    k_mask = (
-        (blk_seq_offs[:, None, :, None] < seq_len) &
-        (blk_offs[None, None, :, None] < KV_BLK_SZ) &
-        (head_sz_div_offs[None, :, None, None] < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD))
-    )
+    # k[MAX_NUM_KV_BLKS, HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
+    # k = tl.load(k_cache_ptr + k_blk_offs, mask=blk_seq_offs[:, None, :, None] < seq_len, other=0.0)
+    k = tl.load(k_cache_ptr + k_blk_offs)
+    # k = k_0.to(tl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
+    # k[HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
+    k = tl.permute(k, [1, 3, 0, 2]) # [HEAD_SZ_POW2/x, x, MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2]
+    k = tl.reshape(k, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
 
-    # k[max_num_kv_blks, HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
-    k_0 = tl.load(k_cache_ptr + k_blk_offs)
-    k = k_0.to(tl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
-    k = k.to(compute_type)
-    # k[HEAD_SZ_POW2, max_num_kv_blks * KV_BLK_SZ_POW2]
-    k = tl.permute(k, [1, 3, 0, 2]) # [HEAD_SZ_POW2/x, x, max_num_kv_blks, KV_BLK_SZ_POW2]
-    k = tl.reshape(k, [HEAD_SZ_POW2, max_num_kv_blks * KV_BLK_SZ_POW2])
+    if k.dtype.is_fp8():
+        # print("k_cache_ptr.dtype.element_ty=", k_cache_ptr.dtype.element_ty)
+        # q = q.to(tl.float8e4nv)
+        # q = q.to(tl.float8e4b8)
+        q = q.to(k_cache_ptr.dtype.element_ty)
+        k_qk_type = k
+        # q = q.to(compute_type)
+        # k_qk_type = k.to(compute_type)
+    else:
+        q = (q.to(tl.float32) * softmax_scale).to(compute_type)
+        k_qk_type = k.to(compute_type)
 
-    # qk[QUERY_GRP_SZ_POW2, max_num_kv_blks * KV_BLK_SZ_POW2]
-    qk = tl.dot(q, k, out_dtype=tl.float32)
-    blk_seq_flatten_offs = tl.reshape(blk_seq_offs, [max_num_kv_blks * KV_BLK_SZ_POW2])
+    blk_seq_flatten_offs = tl.reshape(blk_seq_offs, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
+    k_scale_val = k_scale
+    v_scale_val = v_scale
+    if k.dtype.is_fp8():
+    # if tl.is_tensor(k_scale):
+        # [MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2]
+        kv_scale_offs = kv_blk_nums[:, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + blk_offs[None, :]
+        # k_scale_val = tl.load(k_scale + kv_scale_offs, mask=blk_seq_offs < seq_len, other=0.0)
+        # v_scale_val = tl.load(v_scale + kv_scale_offs, mask=blk_seq_offs < seq_len, other=0.0)
+        k_scale_val = tl.load(k_scale + kv_scale_offs)
+        v_scale_val = tl.load(v_scale + kv_scale_offs)
+        # k_scale_val = tl.zeros((MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2), dtype=tl.float32)
+        # v_scale_val = tl.zeros((MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2), dtype=tl.float32)
+
+        k_scale_val = tl.reshape(k_scale_val, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
+        v_scale_val = tl.reshape(v_scale_val, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
+        # [QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
+        k_scale_val = tl.broadcast_to(k_scale_val[None, :], QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
+        v_scale_val = tl.broadcast_to(v_scale_val[None, :], QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
+        # v_scale_val = tl.broadcast_to(v_scale_val[:, None], MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2)
+        k_scale_val = softmax_scale * k_scale_val
+
+    # qk[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
+    qk = tl.dot(q, k_qk_type, out_dtype=tl.float32)
+    if k.dtype.is_fp8():
+        qk = k_scale_val * qk
+
     if alibi_slopes is not None:
         qk += (alibi_slope[:, None] * (blk_seq_flatten_offs - seq_len + 1)[None, :]).to(
             tl.float32
@@ -157,12 +194,11 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     )
 
     max_logit_new = tl.max(qk, axis=1)
-    # p[QUERY_GRP_SZ_POW2, max_num_kv_blks * KV_BLK_SZ_POW2]
+    # p[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
     exp_sum = tl.sum(p, axis=1)
-    p = p.to(compute_type)
 
-    # v_blk_offs[max_num_kv_blks, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
+    # v_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     v_blk_offs = (
         kv_blk_nums[:, None, None] * stride_v_b
         + kv_head_idx * stride_v_nh
@@ -175,13 +211,25 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
         (head_sz_offs[None, :, None] < HEAD_SZ)
     )
 
-    # v[max_num_kv_blks, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
-    v_0 = tl.load(v_cache_ptr + v_blk_offs)
-    v = v_0.to(tl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
-    v = v.to(compute_type)
-    # v[max_num_kv_blks * KV_BLK_SZ_POW2, HEAD_SZ_POW2]
+    # v[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
+    # v = tl.load(v_cache_ptr + v_blk_offs, mask=v_mask, other=0.0)
+    v = tl.load(v_cache_ptr + v_blk_offs)
+    # v = v_0.to(tl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
+    # v[MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2]
     v = tl.permute(v, [0, 2, 1])
-    v = tl.reshape(v, [max_num_kv_blks * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
+    v = tl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
+    # if v.dtype.is_fp8():
+    #     v = v_scale_val * v
+
+    if v.dtype.is_fp8():
+        p = v_scale_val * p
+        # p = p.to(tl.float8e4b8)
+        p = p.to(v_cache_ptr.dtype.element_ty)
+        # p = p.to(compute_type)
+        # v = v.to(compute_type)
+    else:
+        p = p.to(compute_type)
+        v = v.to(compute_type)
 
     max_logits_offs = (
         seq_idx * stride_max_logits_s
@@ -352,9 +400,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
     blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
     seq_lens_ptr,       # [num_seqs]
-    scale,
-    k_scale,
-    v_scale,
+    softmax_scale,
+    k_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
+    v_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
     alibi_slopes,
     stride_max_logits_s,
     stride_max_logits_nh,
@@ -373,6 +421,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     stride_v_hz,
     stride_v_bz,
     stride_bt_s,
+    kv_scale_stride0,
+    kv_scale_stride1,
     kv_type,
     compute_type,
     HEAD_SZ,
@@ -404,7 +454,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
                 v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
                 blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
                 seq_lens_ptr,       # [num_seqs]
-                scale,
+                softmax_scale,
                 k_scale,
                 v_scale,
                 stride_max_logits_s,
@@ -437,7 +487,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
             blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
             seq_lens_ptr,       # [num_seqs]
-            scale,
+            softmax_scale,
             k_scale,
             v_scale,
             alibi_slopes,
@@ -458,6 +508,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             stride_v_hz,
             stride_v_bz,
             stride_bt_s,
+            kv_scale_stride0,
+            kv_scale_stride1,
             compute_type=compute_type,
             HEAD_SZ=HEAD_SZ,
             HEAD_SZ_POW2=HEAD_SZ_POW2,
@@ -635,6 +687,8 @@ def paged_attention_decode(
         value_cache.stride(1),
         value_cache.stride(2),
         block_tables.stride(0),
+        k_scale.stride(0),
+        k_scale.stride(1),
         kv_type=compute_type,
         compute_type=compute_type,
         HEAD_SZ=head_sz,

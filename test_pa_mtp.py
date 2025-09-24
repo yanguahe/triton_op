@@ -1,0 +1,908 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+import argparse
+import random
+from typing import List, Optional, Tuple, Union, Dict
+import hashlib
+import numpy as np
+
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter import paged_attn as ops
+from aiter import pertoken_quant
+from aiter.test_common import benchmark, checkAllclose, perftest
+
+from pa_decode_gluon import paged_attention_decode as paged_attention_decode_gluon
+from pa_decode_triton import paged_attention_decode as paged_attention_decode_triton
+from pa_decode_triton_fp8 import paged_attention_decode as paged_attention_decode_triton_fp8
+import triton.language as tl
+
+
+torch.set_default_device("cuda")
+torch.set_printoptions(sci_mode=False)
+
+uniform_range = (-1, 1)
+STR_DTYPE_TO_TORCH_DTYPE = {
+    "half": torch.half,
+    "bfloat16": torch.bfloat16,
+    "float": torch.float,
+    "fp8": torch.uint8,
+    "fp8_e4m3": torch.uint8,
+    "fp8_e5m2": torch.uint8,
+}
+
+tl_to_torch_dtype = {tl.bfloat16: torch.bfloat16, tl.float16: torch.float16}
+torch_to_tl_dtype = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
+
+
+def setup_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+setup_seed(123)
+
+
+def compare_arrays(arr1: np.ndarray, arr2: np.ndarray, 
+                   k: int = 5, 
+                   thresholds: List[float] = [0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1]) -> Dict:
+    """
+    Compare two numpy arrays and compute various difference metrics.
+    
+    Args:
+        arr1: First input array (float32)
+        arr2: Second input array (float32)
+        k: Number of top differences to return
+        thresholds: List of thresholds for difference magnitude analysis
+        
+    Returns:
+        Dictionary containing:
+        - top_k_diff: Top k absolute differences with their positions
+        - threshold_stats: Count and percentage of differences above each threshold
+        - nan_info: Information about NaN values in input arrays
+    """
+    # Check input shapes
+    if arr1.shape != arr2.shape:
+        raise ValueError("Input arrays must have the same shape")
+    arr1 = arr1.astype(np.float32)
+    arr2 = arr2.astype(np.float32)
+
+    result = {
+        'top_k_diff': [],
+        'threshold_stats': [],
+        'nan_info': {}
+    }
+
+    # Check for NaN values
+    nan_mask1 = np.isnan(arr1)
+    nan_mask2 = np.isnan(arr2)
+    
+    if np.any(nan_mask1):
+        result['nan_info']['arr1_nan_count'] = np.sum(nan_mask1)
+        result['nan_info']['arr1_nan_positions'] = np.argwhere(nan_mask1)
+        print(f"Warning: arr1 contains {result['nan_info']['arr1_nan_count']} NaN values")
+    
+    if np.any(nan_mask2):
+        result['nan_info']['arr2_nan_count'] = np.sum(nan_mask2)
+        result['nan_info']['arr2_nan_positions'] = np.argwhere(nan_mask2)
+        print(f"Warning: arr2 contains {result['nan_info']['arr2_nan_count']} NaN values")
+    
+    # Compute absolute differences
+    diff = np.abs(arr1 - arr2)
+    total_elements = arr1.size
+
+    max_diff_thr = diff / (1.0 + np.abs(arr2))
+    max_diff_thr = max_diff_thr.max()
+    print(f"diff.abs.max={diff.max()}")
+    print(f"max_diff_thr={max_diff_thr}")
+
+    # Find top k differences
+    flat_diff = diff.flatten()
+    top_k_indices = np.argpartition(flat_diff, -k)[-k:]
+    top_k_indices = top_k_indices[np.argsort(-flat_diff[top_k_indices])]
+
+    # Convert flat indices to multi-dimensional indices
+    orig_indices = np.unravel_index(top_k_indices, diff.shape)
+    for i in range(k):
+        idx = tuple(dim[i] for dim in orig_indices)
+        result['top_k_diff'].append({
+            'value': diff[idx],
+            'position': idx,
+            'arr1_value': arr1[idx],
+            'arr2_value': arr2[idx]
+        })
+
+    # Compute threshold statistics
+    for i in range(len(thresholds) - 1):
+        lower = thresholds[i]
+        upper = thresholds[i + 1]
+        mask = (diff >= lower) & (diff < upper)
+        count = np.sum(mask)
+        result['threshold_stats'].append({
+            'range': f"[{lower:.1e}, {upper:.1e})",
+            'count': count,
+            'percentage': 100 * count / total_elements
+        })
+    
+    # Handle values above the largest threshold
+    mask = diff >= thresholds[-1]
+    count = np.sum(mask)
+    result['threshold_stats'].append({
+        'range': f">={thresholds[-1]:.1e}",
+        'count': count,
+        'percentage': 100 * count / total_elements
+    })
+
+    print("\nTop differences:")
+    for item in result['top_k_diff']:
+        print(f"Position {item['position']}: arr1 = {arr1[item['position']]:.6f}, arr2 = {arr2[item['position']]:.6f}, Diff = {item['value']:.6f}")
+
+    print("\nThreshold statistics:")
+    for stat in result['threshold_stats']:
+        print(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
+
+    print("\nNaN info:")
+    print(result['nan_info'])
+
+    return result
+
+
+def get_kv_cache_torch_dtype(
+    cache_dtype: Optional[Union[str, torch.dtype]],
+    model_dtype: Optional[Union[str, torch.dtype]] = None,
+) -> torch.dtype:
+    if isinstance(cache_dtype, str):
+        if cache_dtype == "auto":
+            if isinstance(model_dtype, str):
+                torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[model_dtype]
+            elif isinstance(model_dtype, torch.dtype):
+                torch_dtype = model_dtype
+            else:
+                raise ValueError(f"Invalid model dtype: {model_dtype}")
+        elif cache_dtype in ["half", "bfloat16", "float"]:
+            torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+        elif cache_dtype == "fp8":
+            torch_dtype = torch.uint8
+        else:
+            raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+    elif isinstance(cache_dtype, torch.dtype):
+        torch_dtype = cache_dtype
+    else:
+        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+    return torch_dtype
+
+
+def kv_cache_factory(
+    num_blocks: int,
+    block_size: int,
+    num_layers: int,
+    num_heads: int,
+    head_size: int,
+    cache_dtype: Optional[Union[str, torch.dtype]],
+    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    seed: int = 0,
+    device: Optional[str] = "cuda",
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+
+    if cache_dtype == "fp8" and head_size % 16:
+        raise ValueError(
+            f"Does not support key cache of type fp8 with head_size {head_size}"
+        )
+
+    torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
+
+    # softmax_scale = head_size**-0.5
+    x = 16 // torch_dtype.itemsize
+    k_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
+    k_caches: List[torch.Tensor] = []
+    for _ in range(num_layers):
+        k_cache = torch.empty(size=k_cache_shape, dtype=torch_dtype, device=device)
+        if cache_dtype in ["auto", "half", "bfloat16", "float"]:
+            k_cache.uniform_(*uniform_range)
+        else:
+            raise ValueError(f"Does not support key cache of type {cache_dtype}")
+        k_caches.append(k_cache)
+
+    v_cache_shape = (num_blocks, num_heads, head_size, block_size)
+    v_caches: List[torch.Tensor] = []
+    for _ in range(num_layers):
+        v_cache = torch.empty(size=v_cache_shape, dtype=torch_dtype, device=device)
+        if cache_dtype in ["auto", "half", "bfloat16", "float"]:
+            v_cache.uniform_(*uniform_range)
+        else:
+            raise ValueError(f"Does not support value cache of type {cache_dtype}")
+        v_caches.append(v_cache)
+    return k_caches, v_caches
+
+
+def ref_masked_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    softmax_scale: float,
+    dtype,
+    is_causal=True,
+) -> torch.Tensor:
+    attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * softmax_scale
+    if is_causal:
+        s_q = query.shape[0]
+        s_k = key.shape[0]
+        attn_bias = torch.zeros(s_q, s_k, dtype=query.dtype)
+        temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=s_k - s_q)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+        attn_weights += attn_bias
+    attn_weights = torch.softmax(attn_weights, dim=-1)
+
+    out = torch.einsum("hqk,khd->qhd", attn_weights.float(), value.float())
+    return out.to(dtype)
+
+
+def torch_mha_extend(
+    q,  # [total_q, nheads, headdim_q]
+    k_cache,  # [num_blocks, num_heads, head_size // x, block_size, x]
+    v_cache,  # [num_blocks, num_heads, head_size, block_size]
+    block_tables,
+    seq_lens,
+    qo_indptr,
+    k_scale=None,  # [num_heads, num_blocks * block_size]
+    v_scale=None,  # [num_heads, num_blocks * block_size]
+):
+    num_blocks, num_heads, head_size, block_size = v_cache.shape
+    sm_scale = 1.0 / (head_size**0.5)
+
+    dtype = q.dtype
+    kv_dtype = k_cache.dtype
+    qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
+
+    # (num_blocks, num_heads, head_size // x, block_size, x)
+    k_cache = k_cache.permute(0, 3, 1, 2, 4).contiguous().view(-1, num_heads, head_size)
+    # (num_blocks, num_heads, head_size, block_size)
+    v_cache = v_cache.permute(0, 3, 1, 2).contiguous().view(-1, num_heads, head_size)
+
+    bs = qo_indptr.shape[0] - 1
+
+    os = []
+    for i in range(bs):
+        q = qs[i]
+
+        block_table = block_tables[i]
+        ctx_len = seq_lens[i].item()
+
+        idx = (
+            block_table.repeat_interleave(block_size)[:ctx_len] * block_size
+            + torch.arange(ctx_len, device=block_table.device) % block_size
+        )
+
+        k = k_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float)
+        if k_scale is not None:
+            k *= k_scale[:, idx].t().unsqueeze(-1)
+
+        v = v_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float)
+        if v_scale is not None:
+            v *= v_scale[:, idx].t().unsqueeze(-1)
+        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=True)
+        os.append(o)
+    o = torch.concat(os)
+    return o
+
+
+def pertoken_quant_kvcache_symm(
+    # [num_blocks, num_heads, head_size // x, block_size, x]
+    k_cache: torch.Tensor,
+    # [num_blocks, num_heads, head_size, block_size]
+    v_cache: torch.Tensor,
+    quant_dtype: torch.dtype,  # e.g. torch.float8_e4m3fnuz
+    scale_dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_blocks = k_cache.shape[0]
+    num_heads = k_cache.shape[1]
+    head_dim = v_cache.shape[2]
+    block_size = v_cache.shape[3]
+    # x          = k_cache.shape[4]
+    total_tokens = num_blocks * block_size
+
+    # print(f"{k_cache.shape=}{k_cache.stride()=}")
+    # print(f"{v_cache.shape=}{v_cache.stride()=}")
+
+    k_cache_permute = (
+        k_cache.permute(0, 1, 3, 2, 4)
+        .reshape(num_blocks, num_heads, block_size, -1)
+        .contiguous()
+    )
+    v_cache_permute = (
+        v_cache.permute(0, 1, 3, 2)
+        .reshape(num_blocks, num_heads, block_size, -1)
+        .contiguous()
+    )
+
+    k_quant, k_scale_asm = pertoken_quant(k_cache_permute, quant_dtype=quant_dtype)
+    v_quant, v_scale_asm = pertoken_quant(v_cache_permute, quant_dtype=quant_dtype)
+
+    # NOTE: quant_x and original x could be different
+    quant_x = 16 // quant_dtype.itemsize
+
+    k_quant = (
+        k_quant.view(num_blocks, num_heads, block_size, head_dim // quant_x, quant_x)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    k_scale = k_scale_asm.permute(1, 0, 2, 3).contiguous().view(num_heads, total_tokens)
+    v_quant = (
+        v_quant.view(num_blocks, num_heads, block_size, head_dim)
+        .permute(0, 1, 3, 2)
+        .contiguous()
+    )
+    v_scale = v_scale_asm.permute(1, 0, 2, 3).contiguous().view(num_heads, total_tokens)
+
+    # print(f"{k_quant.shape=}{k_quant.stride()=}")
+    # print(f"{k_scale.shape=}{k_scale.stride()=}")
+    # print(f"{v_quant.shape=}{v_quant.stride()=}")
+    # print(f"{v_scale.shape=}{v_scale.stride()=}")
+    # print(f"k_cache_permute:{k_cache_permute[0, :, :, :]}, k_quant:{k_quant[0, :, :, :, :]}, k_scale:{k_scale[:, 0]}")
+
+    return k_quant, k_scale, v_quant, v_scale, k_scale_asm, v_scale_asm
+
+
+@perftest()
+def run_aiter_asm(
+    query,
+    k_cache,
+    v_cache,
+    block_tables,
+    seq_lens,
+    block_tables_stride0,
+    max_qlen,
+    k_scale=None,
+    v_scale=None,
+    qo_indptr=None,
+):
+    return aiter.pa_fwd_asm(
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        block_tables_stride0,
+        max_qlen,
+        k_scale,
+        v_scale,
+        None,
+        qo_indptr,
+    )
+
+
+@perftest()
+def run_aiter_hip(
+    query,
+    k_cache,
+    v_cache,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    max_qlen,
+    kv_cache_dtype,
+    num_kv_heads,
+    softmax_scale,
+    k_scale=None,
+    v_scale=None,
+    q_scale=None,
+):
+    return aiter.paged_attn.PagedAttention.forward_decode(
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        kv_cache_dtype,
+        num_kv_heads,
+        softmax_scale,
+        None,
+        k_scale,
+        v_scale,
+        q_scale=q_scale,
+        mtp=max_qlen,
+    )
+
+
+def asm_V_shuffle(VC):
+    # [num_blocks, num_kv_heads, head_size, block_size]
+    x = 16 // VC.element_size()
+    num_blocks, num_kv_heads, head_size, block_size = VC.shape
+    VC = VC.view(num_blocks, num_kv_heads, head_size, block_size // x, x)
+    # [num_blocks, num_kv_heads, block_size/X, head_size, X]
+    VC = VC.permute(0, 1, 3, 2, 4).contiguous()
+    return VC
+
+
+def run_triton(
+    output: torch.Tensor,       # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    query: torch.Tensor,        # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    key_cache: torch.Tensor,    # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    value_cache: torch.Tensor,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    seq_lens: torch.Tensor,     # [num_seqs]
+    block_tables: torch.Tensor, # [num_seqs, max_num_blks_per_seq]
+    attn_scale: float,
+    max_seq_len: int,
+    compute_type,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    num_seq_partitions: int = 0,  # TODO use this below
+    alibi_slopes: torch.Tensor = None,
+    max_logits: torch.Tensor = None,
+    exp_sums: torch.Tensor = None,
+    tmp_output: torch.Tensor = None,
+) -> None:
+    result = paged_attention_decode_triton(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        seq_lens,
+        block_tables,
+        attn_scale,
+        max_seq_len,
+        compute_type,
+        k_scale,
+        v_scale,
+        num_seq_partitions=0,
+        alibi_slopes=None,
+    )
+    return output, result
+
+
+def run_triton_fp8(
+    output: torch.Tensor,       # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    query: torch.Tensor,        # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    key_cache: torch.Tensor,    # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    value_cache: torch.Tensor,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    seq_lens: torch.Tensor,     # [num_seqs]
+    block_tables: torch.Tensor, # [num_seqs, max_num_blks_per_seq]
+    attn_scale: float,
+    max_seq_len: int,
+    compute_type,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    num_seq_partitions: int = 0,  # TODO use this below
+    alibi_slopes: torch.Tensor = None,
+    max_logits: torch.Tensor = None,
+    exp_sums: torch.Tensor = None,
+    tmp_output: torch.Tensor = None,
+) -> None:
+    result = paged_attention_decode_triton_fp8(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        seq_lens,
+        block_tables,
+        attn_scale,
+        max_seq_len,
+        compute_type,
+        k_scale,
+        v_scale,
+        num_seq_partitions=0,
+        alibi_slopes=None,
+    )
+    return output, result
+
+
+def run_gluon(
+    output: torch.Tensor,       # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    query: torch.Tensor,        # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    key_cache: torch.Tensor,    # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    value_cache: torch.Tensor,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    seq_lens: torch.Tensor,     # [num_seqs]
+    block_tables: torch.Tensor, # [num_seqs, max_num_blks_per_seq]
+    attn_scale: float,
+    max_seq_len: int,
+    compute_type,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    num_seq_partitions: int = 0,  # TODO use this below
+    alibi_slopes: torch.Tensor = None,
+    max_logits: torch.Tensor = None,
+    exp_sums: torch.Tensor = None,
+    tmp_output: torch.Tensor = None,
+) -> None:
+    result = paged_attention_decode_gluon(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        seq_lens,
+        block_tables,
+        attn_scale,
+        max_seq_len,
+        compute_type,
+        k_scale,
+        v_scale,
+        num_seq_partitions=0,
+        alibi_slopes=None,
+    )
+    return output, result
+
+
+@benchmark()
+def test_pa_mtp(
+    ctx_lens: int,
+    batch_size: int,
+    num_heads: Tuple[int, int],
+    head_size: int,
+    block_size: int,
+    dtype: torch.dtype,
+    qlen,
+) -> dict:
+    ret = {}
+    seed = 0
+    device = "cuda:0"
+    torch.set_default_device(device)
+    num_query_heads, num_kv_heads = num_heads
+
+    assert num_query_heads % num_kv_heads == 0
+    max_seq_len = 16384
+    max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
+    num_blocks = max_num_blocks_per_seq * batch_size
+    num_blocks_per_seq = (ctx_lens + block_size - 1) // block_size
+
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
+    seq_lens_qo = torch.randint(
+        1, 5, (batch_size,), dtype=torch.int, device=device
+    ).fill_(qlen)
+    # print(seq_lens_qo)
+    qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    total_qo = qo_indptr[-1].item()
+    max_qlen = seq_lens_qo.max().item()
+
+    qkv = torch.randn(
+        total_qo,
+        num_query_heads + 2 * num_kv_heads,
+        head_size,
+        dtype=dtype,
+    )
+    query, key, value = torch.split(
+        qkv, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
+    )
+    query.uniform_(*uniform_range)
+
+    # seq_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(batch_size)]
+    seq_lens = [ctx_lens for _ in range(batch_size)]
+    seq_lens = torch.tensor(seq_lens, dtype=torch.int)
+
+    # Create the block tables.
+    block_tables_lst: List[List[int]] = []
+    for _ in range(batch_size):
+        block_table = [
+            random.randint(0, num_blocks - 1) for _ in range(num_blocks_per_seq)
+        ]
+        block_tables_lst.append(block_table)
+
+    block_tables = torch.tensor(block_tables_lst, dtype=torch.int)
+
+    # Create the KV caches.
+    k_caches, v_caches = kv_cache_factory(
+        num_blocks,
+        block_size,
+        1,
+        num_kv_heads,
+        head_size,
+        "auto",
+        dtype,
+        seed,
+        device,
+    )
+    k_cache, v_cache = k_caches[0], v_caches[0]
+
+    out_ref_noquant = torch_mha_extend(
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        qo_indptr,
+    )
+
+    # out_asm_noquant, us_asm_noquant = run_aiter_asm(
+    #     query,
+    #     k_cache,
+    #     asm_V_shuffle(v_cache),
+    #     block_tables,
+    #     seq_lens,
+    #     block_tables.size(1),
+    #     max_qlen,
+    #     qo_indptr=qo_indptr,
+    # )
+    # err_noquant = checkAllclose(
+    #     out_ref_noquant,
+    #     out_asm_noquant,
+    #     msg=f"[torch vs  aiter_asm][No Quant]: {us_asm_noquant:>8.2f} us......",
+    # )
+    # ret["us_asm_bf16"] = us_asm_noquant
+    # ret["err_asm_bf16"] = err_noquant
+
+    softmax_scale = float(1.0 / (head_size**0.5))
+    out_hip_noquant, us_hip = run_aiter_hip(
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        ctx_lens,
+        max_qlen,
+        "auto",
+        num_kv_heads,
+        softmax_scale,
+    )
+    err_hip_noquant = checkAllclose(
+        out_ref_noquant,
+        out_hip_noquant,
+        msg=f"[torch vs aiter_hip][No Quant]: {us_hip:>8.2f} us......",
+    )
+
+    triton_output = torch.empty_like(out_hip_noquant)
+    triton_output, us_triton = run_triton(
+        triton_output,
+        query,
+        k_cache,
+        v_cache,
+        seq_lens,
+        block_tables,
+        softmax_scale,
+        seq_lens.max().item(),
+        torch_to_tl_dtype[dtype],
+        k_scale=torch.tensor(1.0, device=query.device, dtype=torch.float32),
+        v_scale=torch.tensor(1.0, device=query.device, dtype=torch.float32),
+        num_seq_partitions=0,
+        alibi_slopes=None,
+    )
+    us_triton = us_triton['triton']
+    err_triton_noquant = checkAllclose(
+        out_ref_noquant,
+        triton_output,
+        msg=f"[torch vs triton][No Quant]: {us_triton:>8.2f} us......",
+    )
+
+
+    # ################## quant start ######################
+    q_quant, q_scale = pertoken_quant(query, quant_dtype=aiter.dtypes.fp8)
+    k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
+        pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
+    )
+
+
+    k_ref = k_cache.transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1).to(torch.float32)
+    v_ref = v_cache.transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1).to(torch.float32)
+    k_cvted = (k_scale_asm.unsqueeze(2) * k_quant_.to(torch.float32)).transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1)
+    v_cvted = (v_scale_asm.transpose(2, 3) * v_quant_.to(torch.float32)).transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1)
+    # compare_arrays(k_cvted.to(torch.float32).detach().cpu().numpy(), k_ref.to(torch.float32).detach().cpu().numpy())
+    # compare_arrays(v_cvted.to(torch.float32).detach().cpu().numpy(), v_ref.to(torch.float32).detach().cpu().numpy())
+    k_ref_md5 = hashlib.md5(k_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    v_ref_md5 = hashlib.md5(v_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    k_cvted_md5 = hashlib.md5(k_cvted.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    v_cvted_md5 = hashlib.md5(v_cvted.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    print(f"k_ref_md5={k_ref_md5}")
+    print(f"v_ref_md5={v_ref_md5}")
+    print(f"k_cvted_md5={k_cvted_md5}")
+    print(f"v_cvted_md5={v_cvted_md5}")
+
+
+    triton_output = torch.empty_like(out_hip_noquant)
+    triton_output, us_triton = run_triton_fp8(
+        triton_output,
+        query,
+        # k_cache,
+        # v_cache,
+        k_quant_,
+        v_quant_,
+        seq_lens,
+        block_tables,
+        softmax_scale,
+        seq_lens.max().item(),
+        torch_to_tl_dtype[dtype],
+        k_scale=k_scale_asm,
+        v_scale=v_scale_asm,
+        num_seq_partitions=0,
+        alibi_slopes=None,
+    )
+    # import pdb
+    # pdb.set_trace()
+    tmp_out = us_triton['tmp_output']
+    tmp_out = tmp_out.reshape(batch_size, -1, head_size)
+
+    us_triton = us_triton['triton']
+    err_triton_noquant = checkAllclose(
+        out_ref_noquant,
+        triton_output,
+        atol=2e-2,
+        rtol=2e-2,
+        msg=f"[torch vs triton_fp8][No Quant]: {us_triton:>8.2f} us......",
+    )
+    compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
+    # compare_arrays(tmp_out.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
+
+    ret["us_hip_bf16"] = us_hip
+    ret["us_triton_bf16"] = us_triton
+    ret["err_hip_bf16"] = err_hip_noquant
+    ret["err_triton_bf16"] = err_triton_noquant
+
+
+    out_ref_noquant_md5 = hashlib.md5(out_ref_noquant.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    triton_output_md5 = hashlib.md5(triton_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    # tmp_out_md5 = hashlib.md5(tmp_out.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    print(f"out_ref_noquant_md5={out_ref_noquant_md5}")
+    print(f"triton_output_md5={triton_output_md5}")
+    # print(f"tmp_out_md5={tmp_out_md5}")
+    print(f"dtype={dtype}")
+    # print(f"qkv.dtype={qkv.dtype}")
+    # print(f"k_cache.dtype={k_cache.dtype}")
+    # print(f"q_quant.dtype={q_quant.dtype}")
+    # print(f"k_quant_.dtype={k_quant_.dtype}")
+    # print(f"k_scale_asm.dtype={k_scale_asm.dtype}")
+
+    # print(f"qkv.shape={qkv.shape}")
+    # print(f"query.shape={query.shape}")
+    # print(f"k_cache.shape={k_cache.shape}")
+    # print(f"v_cache.shape={v_cache.shape}")
+    # print(f"q_quant.shape={q_quant.shape}")
+    # print(f"q_scale.shape={q_scale.shape}")
+    # print(f"k_quant_.shape={k_quant_.shape}")
+    # print(f"k_scale_.shape={k_scale_.shape}")
+    # print(f"v_quant_.shape={v_quant_.shape}")
+    # print(f"v_scale_.shape={v_scale_.shape}")
+    # print(f"k_scale_asm.shape={k_scale_asm.shape}")
+    # print(f"v_scale_asm.shape={v_scale_asm.shape}")
+    # print(f"batch_size={batch_size}")
+    # print(f"seq_lens={seq_lens}")
+
+    # # torch ref
+    # out_ref = torch_mha_extend(
+    #     query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
+    # )
+    out_aiter_asm, us_aiter_asm = run_aiter_asm(
+        query,
+        k_quant_,
+        asm_V_shuffle(v_quant_),
+        block_tables,
+        seq_lens,
+        block_tables.size(1),
+        max_qlen,
+        k_scale_asm,
+        v_scale_asm,
+        qo_indptr,
+    )
+    err = checkAllclose(
+        out_ref_noquant,
+        out_aiter_asm,
+        msg=f"[torch vs  aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
+    )
+    compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
+    # ret["us_asm_fp8"] = us_aiter_asm
+    # ret["err fp8"] = err
+
+
+    # q_scale = q_scale.squeeze(-1)
+    # out_hip, us_hip = run_aiter_hip(
+    #     q_quant.to(torch.bfloat16),
+    #     k_quant_,
+    #     asm_V_shuffle(v_quant_),
+    #     block_tables,
+    #     seq_lens,
+    #     ctx_lens,
+    #     max_qlen,
+    #     "fp8",
+    #     num_kv_heads,
+    #     softmax_scale,
+    #     k_scale_asm,
+    #     v_scale_asm,
+    #     q_scale,
+    # )
+    # err = checkAllclose(
+    #     out_ref_noquant,
+    #     out_hip,
+    #     msg=f"[torch vs  aiter_hip][   Quant]: {us_hip:>8.2f} us......",
+    # )
+    # compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
+
+    # ret["us_hip_fp8"] = us_hip
+    # ret["err_hip_fp8"] = err
+
+    return ret
+
+
+head_dim = 128
+block_size = 16
+l_dtype = ["bf16"]
+l_num_heads = [(5, 1), (8, 1), (10, 1)]
+l_qlen = [1, 2, 3, 4]
+l_ctx_len = [7, 26, 57, 66, 109, 128, 256, 257, 282, 512, 513, 4097, 4096]
+l_batch_size = [128, 32]
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-n",
+    "--num_heads",
+    type=dtypes.str2tuple,
+    default=None,
+    help="""Number of heads.
+    e.g. -n 8,1""",
+)
+parser.add_argument(
+    "-q",
+    "--qlen",
+    type=int,
+    choices=l_qlen,
+    default=None,
+    help="""Query length.
+    e.g. -q 1""",
+)
+parser.add_argument(
+    "-c",
+    "--ctx_len",
+    type=int,
+    choices=l_ctx_len,
+    default=None,
+    help="""Context length.
+    e.g. -c 128""",
+)
+parser.add_argument(
+    "-b",
+    "--batch_size",
+    type=int,
+    choices=l_batch_size,
+    default=None,
+    help="""Batch size.
+    e.g. -b 128""",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.num_heads is not None:
+    l_num_heads = [args.num_heads]
+if args.qlen is not None:
+    l_qlen = [args.qlen]
+if args.ctx_len is not None:
+    l_ctx_len = [args.ctx_len]
+if args.batch_size is not None:
+    l_batch_size = [args.batch_size]
+
+for dtype in l_dtype:
+    df = []
+    for num_heads in l_num_heads:
+        for qlen in l_qlen:
+            for ctx_len in l_ctx_len:
+                for batch_size in l_batch_size:
+                    ret = test_pa_mtp(
+                        ctx_len,
+                        batch_size,
+                        num_heads,
+                        head_dim,
+                        block_size,
+                        dtype,
+                        qlen,
+                    )
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    aiter.logger.info(f"summary:\n{df}")
+    # df.to_csv("mla_prefill.csv")
