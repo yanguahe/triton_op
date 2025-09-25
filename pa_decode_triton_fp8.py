@@ -25,7 +25,7 @@ ttgir_file_path = os.path.join(os.path.dirname(__file__), "./ttgir/pa_noloop.ttg
 
 
 @triton.jit
-def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
+def pa_decode_v2_fp8(
     exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
     max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
     logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
@@ -35,6 +35,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
     seq_lens_ptr,       # [num_seqs]
     softmax_scale,
+    q_scale,            # [num_seqs, num_kv_heads * query_grp_sz, 1]
     k_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
     v_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
     alibi_slopes,
@@ -55,6 +56,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     stride_v_nh,
     stride_v_hz,
     stride_bt_s,
+    q_scale_stride0,
     kv_scale_stride0,
     kv_scale_stride1,
     compute_type: tl.constexpr,
@@ -119,6 +121,14 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     q_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
     q = tl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
 
+    q_scale_offs = seq_idx * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + q_grp_offs
+    if q.dtype.is_fp8():
+        # [QUERY_GRP_SZ_POW2]
+        q_scale_val = tl.load(q_scale + q_scale_offs, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
+        # q_scale_val = tl.load(q_scale + q_scale_offs)
+        q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+        q = q_scale_val * q.to(tl.float32)
+
     # k_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
     k_blk_offs = (
         kv_blk_nums[:, None, None, None] * stride_k_b
@@ -174,8 +184,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
         v_scale_val = tl.reshape(v_scale_val, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
         # [QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
         k_scale_val = tl.broadcast_to(k_scale_val[None, :], QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
-        v_scale_val = tl.broadcast_to(v_scale_val[None, :], QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
-        # v_scale_val = tl.broadcast_to(v_scale_val[:, None], MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2)
+        # v_scale_val = tl.broadcast_to(v_scale_val[None, :], QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
+        v_scale_val = tl.broadcast_to(v_scale_val[:, None], MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2)
         k_scale_val = softmax_scale * k_scale_val
 
     # qk[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
@@ -218,11 +228,12 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     # v[MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2]
     v = tl.permute(v, [0, 2, 1])
     v = tl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
-    # if v.dtype.is_fp8():
-    #     v = v_scale_val * v
+    if v.dtype.is_fp8():
+        v = v_scale_val * v.to(tl.float32)
+        v = v.to(v_cache_ptr.dtype.element_ty)
 
     if v.dtype.is_fp8():
-        p = v_scale_val * p
+        # p = v_scale_val * p
         # p = p.to(tl.float8e4b8)
         p = p.to(v_cache_ptr.dtype.element_ty)
         # p = p.to(compute_type)
@@ -401,6 +412,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
     seq_lens_ptr,       # [num_seqs]
     softmax_scale,
+    q_scale,            # [num_seqs, num_kv_heads * query_grp_sz, 1]
     k_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
     v_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
     alibi_slopes,
@@ -421,6 +433,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     stride_v_hz,
     stride_v_bz,
     stride_bt_s,
+    q_scale_stride0,
     kv_scale_stride0,
     kv_scale_stride1,
     kv_type,
@@ -478,7 +491,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         except Exception as e:
             print(f"Compilation failed: {e}")
     else:
-        _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk[grid](
+        pa_decode_v2_fp8[grid](
             exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
             max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
             logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
@@ -488,8 +501,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
             seq_lens_ptr,       # [num_seqs]
             softmax_scale,
-            k_scale,
-            v_scale,
+            q_scale,            # [num_seqs, num_kv_heads * query_grp_sz, 1]
+            k_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
+            v_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
             alibi_slopes,
             stride_max_logits_s,
             stride_max_logits_nh,
@@ -508,6 +522,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             stride_v_hz,
             stride_v_bz,
             stride_bt_s,
+            q_scale_stride0,
             kv_scale_stride0,
             kv_scale_stride1,
             compute_type=compute_type,
@@ -581,6 +596,7 @@ def paged_attention_decode(
     attn_scale: float,
     max_seq_len: int,
     compute_type,
+    q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     num_seq_partitions: int = 0,  # TODO use this below
@@ -632,29 +648,29 @@ def paged_attention_decode(
     else:
         query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
 
-    print(f"query.shape={query.shape}")
-    print(f"key_cache.shape={key_cache.shape}")
-    print(f"value_cache.shape={value_cache.shape}")
-    print(f"output.shape={output.shape}")
-    print(f"block_tables.shape={block_tables.shape}")
-    print(f"query.dtype={query.dtype}")
-    print(f"key_cache.dtype={key_cache.dtype}")
-    print(f"value_cache.dtype={value_cache.dtype}")
-    print(f"output.dtype={output.dtype}")
-    print(f"block_tables.dtype={block_tables.dtype}")
-    input_config = dict(
-        qlen=qlen,
-        kv_type=compute_type,
-        compute_type=compute_type,
-        HEAD_SZ=head_sz,
-        HEAD_SZ_POW2=head_sz_pow2,
-        QUERY_GRP_SZ=query_grp_sz,
-        QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
-        KV_BLK_SZ=kv_blk_sz,
-        KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-        SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-    )
-    print(input_config)
+    # print(f"query.shape={query.shape}")
+    # print(f"key_cache.shape={key_cache.shape}")
+    # print(f"value_cache.shape={value_cache.shape}")
+    # print(f"output.shape={output.shape}")
+    # print(f"block_tables.shape={block_tables.shape}")
+    # print(f"query.dtype={query.dtype}")
+    # print(f"key_cache.dtype={key_cache.dtype}")
+    # print(f"value_cache.dtype={value_cache.dtype}")
+    # print(f"output.dtype={output.dtype}")
+    # print(f"block_tables.dtype={block_tables.dtype}")
+    # input_config = dict(
+    #     qlen=qlen,
+    #     kv_type=compute_type,
+    #     compute_type=compute_type,
+    #     HEAD_SZ=head_sz,
+    #     HEAD_SZ_POW2=head_sz_pow2,
+    #     QUERY_GRP_SZ=query_grp_sz,
+    #     QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
+    #     KV_BLK_SZ=kv_blk_sz,
+    #     KV_BLK_SZ_POW2=kv_blk_sz_pow2,
+    #     SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+    # )
+    # print(input_config)
 
     _, decode_time = _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         grid,
@@ -667,6 +683,7 @@ def paged_attention_decode(
         block_tables,
         seq_lens,
         attn_scale,
+        q_scale,
         k_scale,
         v_scale,
         alibi_slopes,
@@ -687,6 +704,7 @@ def paged_attention_decode(
         value_cache.stride(1),
         value_cache.stride(2),
         block_tables.stride(0),
+        q_scale.stride(0),
         k_scale.stride(0),
         k_scale.stride(1),
         kv_type=compute_type,

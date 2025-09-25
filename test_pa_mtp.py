@@ -466,6 +466,7 @@ def run_triton_fp8(
     attn_scale: float,
     max_seq_len: int,
     compute_type,
+    q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     num_seq_partitions: int = 0,  # TODO use this below
@@ -484,6 +485,7 @@ def run_triton_fp8(
         attn_scale,
         max_seq_len,
         compute_type,
+        q_scale,
         k_scale,
         v_scale,
         num_seq_partitions=0,
@@ -598,6 +600,7 @@ def test_pa_mtp(
     )
     k_cache, v_cache = k_caches[0], v_caches[0]
 
+
     out_ref_noquant = torch_mha_extend(
         query,
         k_cache,
@@ -625,6 +628,7 @@ def test_pa_mtp(
     # ret["us_asm_bf16"] = us_asm_noquant
     # ret["err_asm_bf16"] = err_noquant
 
+
     softmax_scale = float(1.0 / (head_size**0.5))
     out_hip_noquant, us_hip = run_aiter_hip(
         query,
@@ -643,6 +647,9 @@ def test_pa_mtp(
         out_hip_noquant,
         msg=f"[torch vs aiter_hip][No Quant]: {us_hip:>8.2f} us......",
     )
+    ret["us_hip_bf16"] = us_hip
+    ret["err_hip_bf16"] = err_hip_noquant
+
 
     triton_output = torch.empty_like(out_hip_noquant)
     triton_output, us_triton = run_triton(
@@ -666,6 +673,8 @@ def test_pa_mtp(
         triton_output,
         msg=f"[torch vs triton][No Quant]: {us_triton:>8.2f} us......",
     )
+    ret["us_triton_bf16"] = us_triton
+    ret["err_triton_bf16"] = err_triton_noquant
 
 
     # ################## quant start ######################
@@ -674,27 +683,63 @@ def test_pa_mtp(
         pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
     )
 
+    print(f"dtype={dtype}")
+    print(f"qkv.dtype={qkv.dtype}")
+    print(f"k_cache.dtype={k_cache.dtype}")
+    print(f"q_quant.dtype={q_quant.dtype}")
+    print(f"k_quant_.dtype={k_quant_.dtype}")
+    print(f"k_scale_asm.dtype={k_scale_asm.dtype}")
+    print(f"qkv.shape={qkv.shape}")
+    print(f"query.shape={query.shape}")
+    print(f"k_cache.shape={k_cache.shape}")
+    print(f"v_cache.shape={v_cache.shape}")
+    print(f"q_quant.shape={q_quant.shape}")
+    print(f"q_scale.shape={q_scale.shape}")
+    print(f"k_quant_.shape={k_quant_.shape}")
+    print(f"k_scale_.shape={k_scale_.shape}")
+    print(f"v_quant_.shape={v_quant_.shape}")
+    print(f"v_scale_.shape={v_scale_.shape}")
+    print(f"k_scale_asm.shape={k_scale_asm.shape}")
+    print(f"v_scale_asm.shape={v_scale_asm.shape}")
+    print(f"batch_size={batch_size}")
+    print(f"seq_lens={seq_lens}")
 
-    k_ref = k_cache.transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1).to(torch.float32)
-    v_ref = v_cache.transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1).to(torch.float32)
-    k_cvted = (k_scale_asm.unsqueeze(2) * k_quant_.to(torch.float32)).transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1)
-    v_cvted = (v_scale_asm.transpose(2, 3) * v_quant_.to(torch.float32)).transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1)
+    # q_cvted = q_scale * q_quant.to(torch.float32)
+    # k_ref = k_cache.transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1).to(torch.float32)
+    # v_ref = v_cache.transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1).to(torch.float32)
+    # k_cvted = (k_scale_asm.unsqueeze(2) * k_quant_.to(torch.float32)).transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1)
+    # v_cvted = (v_scale_asm.transpose(2, 3) * v_quant_.to(torch.float32)).transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1)
+    # compare_arrays(q_cvted.to(torch.float32).detach().cpu().numpy(), query.to(torch.float32).detach().cpu().numpy())
     # compare_arrays(k_cvted.to(torch.float32).detach().cpu().numpy(), k_ref.to(torch.float32).detach().cpu().numpy())
     # compare_arrays(v_cvted.to(torch.float32).detach().cpu().numpy(), v_ref.to(torch.float32).detach().cpu().numpy())
-    k_ref_md5 = hashlib.md5(k_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    v_ref_md5 = hashlib.md5(v_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    k_cvted_md5 = hashlib.md5(k_cvted.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    v_cvted_md5 = hashlib.md5(v_cvted.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    print(f"k_ref_md5={k_ref_md5}")
-    print(f"v_ref_md5={v_ref_md5}")
-    print(f"k_cvted_md5={k_cvted_md5}")
-    print(f"v_cvted_md5={v_cvted_md5}")
+
+    # query_md5 = hashlib.md5(query.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    # q_cvted_md5 = hashlib.md5(q_cvted.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    # k_ref_md5 = hashlib.md5(k_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    # v_ref_md5 = hashlib.md5(v_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    # k_cvted_md5 = hashlib.md5(k_cvted.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    # v_cvted_md5 = hashlib.md5(v_cvted.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    # print(f"query_md5={query_md5}")
+    # print(f"q_cvted_md5={q_cvted_md5}")
+    # print(f"k_ref_md5={k_ref_md5}")
+    # print(f"v_ref_md5={v_ref_md5}")
+    # print(f"k_cvted_md5={k_cvted_md5}")
+    # print(f"v_cvted_md5={v_cvted_md5}")
 
 
+    # quant version torch ref
+    out_ref = torch_mha_extend(
+        query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
+    )
+    # out_ref = out_ref_noquant
+
+
+    fp8_diff_thr = 5e-2
     triton_output = torch.empty_like(out_hip_noquant)
     triton_output, us_triton = run_triton_fp8(
         triton_output,
-        query,
+        # query,
+        q_quant,
         # k_cache,
         # v_cache,
         k_quant_,
@@ -704,6 +749,7 @@ def test_pa_mtp(
         softmax_scale,
         seq_lens.max().item(),
         torch_to_tl_dtype[dtype],
+        q_scale=q_scale,
         k_scale=k_scale_asm,
         v_scale=v_scale_asm,
         num_seq_partitions=0,
@@ -711,58 +757,27 @@ def test_pa_mtp(
     )
     # import pdb
     # pdb.set_trace()
-    tmp_out = us_triton['tmp_output']
-    tmp_out = tmp_out.reshape(batch_size, -1, head_size)
+    # tmp_out = us_triton['tmp_output']
+    # tmp_out = tmp_out.reshape(batch_size, -1, head_size)
 
     us_triton = us_triton['triton']
     err_triton_noquant = checkAllclose(
-        out_ref_noquant,
+        out_ref,
         triton_output,
-        atol=2e-2,
-        rtol=2e-2,
-        msg=f"[torch vs triton_fp8][No Quant]: {us_triton:>8.2f} us......",
+        atol=fp8_diff_thr,
+        rtol=fp8_diff_thr,
+        msg=f"[torch vs triton_fp8][   Quant]: {us_triton:>8.2f} us......",
     )
-    compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
-    # compare_arrays(tmp_out.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
+    # compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    ret["us_triton_fp8"] = us_triton
+    ret["err_triton_fp8"] = err_triton_noquant
 
-    ret["us_hip_bf16"] = us_hip
-    ret["us_triton_bf16"] = us_triton
-    ret["err_hip_bf16"] = err_hip_noquant
-    ret["err_triton_bf16"] = err_triton_noquant
-
-
-    out_ref_noquant_md5 = hashlib.md5(out_ref_noquant.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    out_ref_md5 = hashlib.md5(out_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
     triton_output_md5 = hashlib.md5(triton_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    # tmp_out_md5 = hashlib.md5(tmp_out.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    print(f"out_ref_noquant_md5={out_ref_noquant_md5}")
+    print(f"out_ref_md5={out_ref_md5}")
     print(f"triton_output_md5={triton_output_md5}")
-    # print(f"tmp_out_md5={tmp_out_md5}")
-    print(f"dtype={dtype}")
-    # print(f"qkv.dtype={qkv.dtype}")
-    # print(f"k_cache.dtype={k_cache.dtype}")
-    # print(f"q_quant.dtype={q_quant.dtype}")
-    # print(f"k_quant_.dtype={k_quant_.dtype}")
-    # print(f"k_scale_asm.dtype={k_scale_asm.dtype}")
 
-    # print(f"qkv.shape={qkv.shape}")
-    # print(f"query.shape={query.shape}")
-    # print(f"k_cache.shape={k_cache.shape}")
-    # print(f"v_cache.shape={v_cache.shape}")
-    # print(f"q_quant.shape={q_quant.shape}")
-    # print(f"q_scale.shape={q_scale.shape}")
-    # print(f"k_quant_.shape={k_quant_.shape}")
-    # print(f"k_scale_.shape={k_scale_.shape}")
-    # print(f"v_quant_.shape={v_quant_.shape}")
-    # print(f"v_scale_.shape={v_scale_.shape}")
-    # print(f"k_scale_asm.shape={k_scale_asm.shape}")
-    # print(f"v_scale_asm.shape={v_scale_asm.shape}")
-    # print(f"batch_size={batch_size}")
-    # print(f"seq_lens={seq_lens}")
 
-    # # torch ref
-    # out_ref = torch_mha_extend(
-    #     query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
-    # )
     out_aiter_asm, us_aiter_asm = run_aiter_asm(
         query,
         k_quant_,
@@ -776,13 +791,15 @@ def test_pa_mtp(
         qo_indptr,
     )
     err = checkAllclose(
-        out_ref_noquant,
+        out_ref,
         out_aiter_asm,
+        atol=fp8_diff_thr,
+        rtol=fp8_diff_thr,
         msg=f"[torch vs  aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
     )
-    compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
-    # ret["us_asm_fp8"] = us_aiter_asm
-    # ret["err fp8"] = err
+    # compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    ret["us_asm_fp8"] = us_aiter_asm
+    ret["err fp8"] = err
 
 
     # q_scale = q_scale.squeeze(-1)
@@ -802,12 +819,13 @@ def test_pa_mtp(
     #     q_scale,
     # )
     # err = checkAllclose(
-    #     out_ref_noquant,
+    #     out_ref,
     #     out_hip,
-    #     msg=f"[torch vs  aiter_hip][   Quant]: {us_hip:>8.2f} us......",
+    #     atol=fp8_diff_thr,
+    #     rtol=fp8_diff_thr,
+    #     msg=f"[torch vs  aiter_hip_fp8][   Quant]: {us_hip:>8.2f} us......",
     # )
-    # compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
-
+    # # compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
     # ret["us_hip_fp8"] = us_hip
     # ret["err_hip_fp8"] = err
 
