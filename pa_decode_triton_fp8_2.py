@@ -25,6 +25,268 @@ ttgir_file_path = os.path.join(os.path.dirname(__file__), "./ttgir/pa_noloop.ttg
 
 
 @triton.jit
+def pa_decode_v2_big_blk_fp8(
+    exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+    q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
+    k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
+    seq_lens_ptr,       # [num_seqs]
+    softmax_scale,
+    q_scale,            # [num_seqs, num_kv_heads * query_grp_sz, 1]
+    k_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
+    v_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
+    alibi_slopes,
+    stride_max_logits_s,
+    stride_max_logits_nh,
+    stride_max_logits_p,
+    stride_logits_s,
+    stride_logits_nh,
+    stride_logits_p,
+    stride_logits_g,
+    stride_q_s,
+    stride_q_nh,
+    stride_k_b,
+    stride_k_nh,
+    stride_k_hz,
+    stride_k_bz,
+    stride_v_b,
+    stride_v_nh,
+    stride_v_hz,
+    stride_bt_s,
+    q_scale_stride0,
+    kv_scale_stride0,
+    kv_scale_stride1,
+    compute_type: tl.constexpr,
+    HEAD_SZ: tl.constexpr,
+    HEAD_SZ_POW2: tl.constexpr,
+    QUERY_GRP_SZ: tl.constexpr,
+    QUERY_GRP_SZ_POW2: tl.constexpr,
+    KV_BLK_SZ: tl.constexpr,
+    KV_BLK_SZ_POW2: tl.constexpr,
+    SEQ_PARTITION_SZ: tl.constexpr,
+    TRANS_V: tl.constexpr,          # [num_blks, num_kv_heads, kv_blk_sz/x, head_sz, x]
+):
+    """
+    #TODO: Add Doc
+    """
+
+    seq_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    seq_part_idx = tl.program_id(2)
+
+    log2e: tl.constexpr = 1.4426950408889634
+    # CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr = 8
+    CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr = 16
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    seq_start_idx = seq_part_idx * SEQ_PARTITION_SZ
+    if seq_start_idx >= seq_len:
+        return
+
+    # seq_end_idx = tl.minimum(seq_start_idx + SEQ_PARTITION_SZ, seq_len)
+    # MAX_NUM_KV_BLKS: tl.constexpr = (SEQ_PARTITION_SZ + KV_BLK_SZ - 1) // KV_BLK_SZ
+    V_BLK_SZ_DIV_NUM: tl.constexpr = SEQ_PARTITION_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD
+    # num_kv_blks = tl.cdiv(seq_end_idx - seq_start_idx, KV_BLK_SZ)
+
+
+    pn_blk_offs = tl.arange(0, SEQ_PARTITION_SZ)
+    head_sz_offs = tl.arange(0, HEAD_SZ_POW2)
+    head_sz_div_offs = tl.arange(0, HEAD_SZ_POW2 // CONTIGUOUS_KV_ELEMS_16B_LOAD)
+    q_grp_offs = tl.arange(0, QUERY_GRP_SZ_POW2)
+    contiguous_kv_elems_offs = tl.arange(0, CONTIGUOUS_KV_ELEMS_16B_LOAD)
+    v_blk_sz_div_offs = tl.arange(0, V_BLK_SZ_DIV_NUM)
+
+    # load alibi slopes[QUERY_GRP_SZ_POW2]
+    if alibi_slopes is None:
+        alibi_slope = tl.zeros([QUERY_GRP_SZ_POW2], dtype=tl.float32)
+    else:
+        alibi_slope = tl.load(
+            alibi_slopes + kv_head_idx * QUERY_GRP_SZ + q_grp_offs,
+            mask=q_grp_offs < QUERY_GRP_SZ,
+            other=0.0,
+        )
+
+    # load all kv blocks in one time
+    kv_seq_start = seq_part_idx * SEQ_PARTITION_SZ
+    blk_tb_id = kv_seq_start // KV_BLK_SZ
+    blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
+    page_id = tl.load(blk_tables_start_ptr + blk_tb_id)
+    page_offset = kv_seq_start % KV_BLK_SZ
+
+    # load q[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
+    q_offs = (
+        seq_idx * stride_q_s
+        + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[:, None]) * stride_q_nh
+        + head_sz_offs[None, :]
+    )
+    q_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
+    q = tl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
+
+    q_scale_offs = seq_idx * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + q_grp_offs
+    if q.dtype.is_fp8():
+        # [QUERY_GRP_SZ_POW2]
+        q_scale_val = tl.load(q_scale + q_scale_offs, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
+        # q_scale_val = tl.load(q_scale + q_scale_offs)
+        q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+        q = q_scale_val * q.to(tl.float32)
+
+    # k_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
+    # k_blk_offs = (
+    #     kv_blk_nums[:, None, None, None] * stride_k_b
+    #     + kv_head_idx * stride_k_nh
+    #     + head_sz_div_offs[None, :, None, None] * stride_k_hz
+    #     + blk_offs[None, None, :, None] * CONTIGUOUS_KV_ELEMS_16B_LOAD
+    #     + contiguous_kv_elems_offs[None, None, None, :]
+    # )
+    # k_blk_offs[HEAD_SZ_POW2/x, SEQ_PARTITION_SZ, x]
+    k_blk_offs = (
+        page_id * stride_k_b
+        + kv_head_idx * stride_k_nh
+        + head_sz_div_offs[:, None, None] * stride_k_hz
+        + (page_offset + pn_blk_offs)[None, :, None] * CONTIGUOUS_KV_ELEMS_16B_LOAD
+        + contiguous_kv_elems_offs[None, None, :]
+    )
+
+    # blk_seq_offs[SEQ_PARTITION_SZ]
+    blk_seq_offs = kv_seq_start + pn_blk_offs
+
+    # k_blk_offs[HEAD_SZ_POW2/x, SEQ_PARTITION_SZ, x]
+    # k = tl.load(k_cache_ptr + k_blk_offs, mask=blk_seq_offs[None, :, None] < seq_len, other=0.0)
+    k = tl.load(k_cache_ptr + k_blk_offs)
+    # [HEAD_SZ_POW2/x, SEQ_PARTITION_SZ, x]
+    k = tl.permute(k, [0, 2, 1])
+    k = tl.reshape(k, [HEAD_SZ_POW2, SEQ_PARTITION_SZ])
+
+    if k.dtype.is_fp8():
+        # print("k_cache_ptr.dtype.element_ty=", k_cache_ptr.dtype.element_ty)
+        q = q.to(k_cache_ptr.dtype.element_ty)
+        k_qk_type = k
+        # q = q.to(compute_type)
+        # k_qk_type = k.to(compute_type)
+    else:
+        q = (q.to(tl.float32) * softmax_scale).to(compute_type)
+        k_qk_type = k.to(compute_type)
+
+    k_scale_val = k_scale
+    v_scale_val = v_scale
+    if k.dtype.is_fp8():
+    # if tl.is_tensor(k_scale):
+        # [SEQ_PARTITION_SZ]
+        kv_scale_offs = page_id * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + page_offset + pn_blk_offs
+        # k_scale_val = tl.load(k_scale + kv_scale_offs, mask=blk_seq_offs < seq_len, other=0.0)
+        # v_scale_val = tl.load(v_scale + kv_scale_offs, mask=blk_seq_offs < seq_len, other=0.0)
+        k_scale_val = tl.load(k_scale + kv_scale_offs)
+        v_scale_val = tl.load(v_scale + kv_scale_offs)
+        # k_scale_val = tl.zeros((SEQ_PARTITION_SZ,), dtype=tl.float32)
+        # v_scale_val = tl.zeros((SEQ_PARTITION_SZ,), dtype=tl.float32)
+
+        # [QUERY_GRP_SZ_POW2, SEQ_PARTITION_SZ]
+        k_scale_val = tl.broadcast_to(k_scale_val[None, :], QUERY_GRP_SZ_POW2, SEQ_PARTITION_SZ)
+        # v_scale_val = tl.broadcast_to(v_scale_val[None, :], QUERY_GRP_SZ_POW2, SEQ_PARTITION_SZ)
+        v_scale_val = tl.broadcast_to(v_scale_val[:, None], SEQ_PARTITION_SZ, HEAD_SZ_POW2)
+        k_scale_val = softmax_scale * k_scale_val
+
+    # qk[QUERY_GRP_SZ_POW2, SEQ_PARTITION_SZ]
+    qk = tl.dot(q, k_qk_type, out_dtype=tl.float32)
+    if k.dtype.is_fp8():
+        qk = k_scale_val * qk
+
+    if alibi_slopes is not None:
+        qk += (alibi_slope[:, None] * (blk_seq_offs - seq_len + 1)[None, :]).to(
+            tl.float32
+        )
+    qk = tl.where(
+        (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_offs[None, :] < seq_len),
+        qk,
+        float("-inf"),
+    )
+
+    max_logit_new = tl.max(qk, axis=1)
+    # p[QUERY_GRP_SZ_POW2, SEQ_PARTITION_SZ]
+    p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
+    exp_sum = tl.sum(p, axis=1)
+
+    if TRANS_V:
+        # [num_blocks, num_kv_heads, block_size/x, head_size, x]
+        # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 0:
+        #     print('****************************TRANS_V****************************')
+        #     print('stride_v_b=', stride_v_b)
+        #     print('stride_v_nh=', stride_v_nh)
+        #     print('stride_v_hz=', stride_v_hz)
+        #     print('KV_BLK_SZ_POW2=', KV_BLK_SZ_POW2)
+        #     print('CONTIGUOUS_KV_ELEMS_16B_LOAD=', CONTIGUOUS_KV_ELEMS_16B_LOAD)
+
+        # v_blk_offs[V_BLK_SZ_DIV_NUM, HEAD_SZ_POW2, x]
+        page_offset_div_num = page_offset // CONTIGUOUS_KV_ELEMS_16B_LOAD
+        v_blk_offs = (
+            page_id * stride_v_b
+            + kv_head_idx * stride_v_nh
+            + (page_offset_div_num + v_blk_sz_div_offs)[:, None, None] * stride_v_hz
+            + head_sz_offs[None, :, None] * CONTIGUOUS_KV_ELEMS_16B_LOAD
+            + contiguous_kv_elems_offs[None, None, :]
+        )
+
+        v = tl.load(v_cache_ptr + v_blk_offs)
+        # [V_BLK_SZ_DIV_NUM, HEAD_SZ_POW2, x] --> [V_BLK_SZ_DIV_NUM, x, HEAD_SZ_POW2]
+        v = tl.permute(v, [0, 2, 1])
+        v = tl.reshape(v, [SEQ_PARTITION_SZ, HEAD_SZ_POW2])
+    else:
+        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+        # [HEAD_SZ_POW2, SEQ_PARTITION_SZ]
+        v_blk_offs = (
+            page_id * stride_v_b
+            + kv_head_idx * stride_v_nh
+            + head_sz_offs[:, None] * stride_v_hz
+            + (page_offset + pn_blk_offs)[None, :]
+        )
+        v = tl.load(v_cache_ptr + v_blk_offs)
+        # [SEQ_PARTITION_SZ, HEAD_SZ_POW2]
+        v = tl.permute(v, [1, 0])
+
+    if v.dtype.is_fp8():
+        v = v_scale_val * v.to(tl.float32)
+        v = v.to(v_cache_ptr.dtype.element_ty)
+
+    if v.dtype.is_fp8():
+        # p = v_scale_val * p
+        # p = p.to(tl.float8e4b8)
+        p = p.to(v_cache_ptr.dtype.element_ty)
+        # p = p.to(compute_type)
+        # v = v.to(compute_type)
+    else:
+        p = p.to(compute_type)
+        v = v.to(compute_type)
+
+    max_logits_offs = (
+        seq_idx * stride_max_logits_s
+        + kv_head_idx * stride_max_logits_nh
+        + seq_part_idx * stride_max_logits_p
+        + q_grp_offs
+    )
+    m_grp_mask = q_grp_offs < QUERY_GRP_SZ
+    tl.store(max_logits_ptr + max_logits_offs, max_logit_new, mask=m_grp_mask)
+    tl.store(exp_sums_ptr + max_logits_offs, exp_sum, mask=m_grp_mask)
+
+    # acc[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
+    acc = tl.dot(p, v, out_dtype=tl.float32)
+    acc = acc / exp_sum[:, None]
+    acc = acc.to(compute_type)
+
+    # end up computation
+    logits_offs = seq_idx * stride_logits_s
+    logits_offs += kv_head_idx * stride_logits_nh
+    logits_offs += (
+        seq_part_idx * stride_logits_p
+        + q_grp_offs[:, None] * stride_logits_g
+        + head_sz_offs[None, :]
+    )
+    tl.store(logits_ptr + logits_offs, acc, mask=q_mask)
+
+
+@triton.jit
 def pa_decode_v2_fp8(
     exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
     max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -67,6 +329,7 @@ def pa_decode_v2_fp8(
     KV_BLK_SZ: tl.constexpr,
     KV_BLK_SZ_POW2: tl.constexpr,
     SEQ_PARTITION_SZ: tl.constexpr,
+    TRANS_V: tl.constexpr,          # [num_blks, num_kv_heads, kv_blk_sz/x, head_sz, x]
 ):
     """
     #TODO: Add Doc
@@ -79,8 +342,6 @@ def pa_decode_v2_fp8(
     log2e: tl.constexpr = 1.4426950408889634
     # CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr = 8
     CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr = 16
-    # TRANS_V: tl.constexpr = False
-    TRANS_V: tl.constexpr = True
 
     seq_len = tl.load(seq_lens_ptr + seq_idx)
     seq_start_idx = seq_part_idx * SEQ_PARTITION_SZ
@@ -458,6 +719,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     KV_BLK_SZ,
     KV_BLK_SZ_POW2,
     SEQ_PARTITION_SZ,
+    TRANS_V,
 ):
     # Use ttgir as input
     # print(f"_paged_attn_decode_v2_w_dot_kernel_reshape_wrapper")
@@ -504,7 +766,11 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         except Exception as e:
             print(f"Compilation failed: {e}")
     else:
-        pa_decode_v2_fp8[grid](
+        pa_decode_kernel = pa_decode_v2_fp8
+        if KV_BLK_SZ > SEQ_PARTITION_SZ:
+            pa_decode_kernel = pa_decode_v2_big_blk_fp8
+
+        pa_decode_kernel[grid](
             exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
             max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
             logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
@@ -546,6 +812,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             KV_BLK_SZ=KV_BLK_SZ,
             KV_BLK_SZ_POW2=KV_BLK_SZ_POW2,
             SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
+            TRANS_V=TRANS_V,
         )
 
 
@@ -635,6 +902,7 @@ def paged_attention_decode(
     query_grp_sz = num_q_heads // num_kv_heads
     query_grp_sz *= qlen
     query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
+    num_seqs //= qlen
 
     # Note: There is a bug in triton.next_power_of_2 function which causes it
     # to update the passed in arg, so that's why we have a workaround here
@@ -649,6 +917,7 @@ def paged_attention_decode(
 
     grid = (num_seqs, num_kv_heads, max_num_partitions)
     shape_info = (num_seqs, num_kv_heads, max_num_partitions, query_grp_sz)
+    print(f"shape_info={shape_info}")
     max_logits = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
     exp_sums = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
     # tmp_output = torch.empty(
@@ -660,31 +929,40 @@ def paged_attention_decode(
         query_grp_sz_pow2 = 16
     else:
         query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
+    trans_v = None
+    if len(value_cache.shape) == 5:
+        trans_v = True
+    elif len(value_cache.shape) == 4:
+        trans_v = False
+    else:
+        raise RuntimeError(f"Do not support such value_cache shape:{value_cache.shape}")
 
-    # print(f"query.shape={query.shape}")
-    # print(f"key_cache.shape={key_cache.shape}")
-    # print(f"value_cache.shape={value_cache.shape}")
-    # print(f"value_cache.stride()={value_cache.stride()}")
-    # print(f"output.shape={output.shape}")
-    # print(f"block_tables.shape={block_tables.shape}")
-    # print(f"query.dtype={query.dtype}")
-    # print(f"key_cache.dtype={key_cache.dtype}")
-    # print(f"value_cache.dtype={value_cache.dtype}")
-    # print(f"output.dtype={output.dtype}")
-    # print(f"block_tables.dtype={block_tables.dtype}")
-    # input_config = dict(
-    #     qlen=qlen,
-    #     kv_type=compute_type,
-    #     compute_type=compute_type,
-    #     HEAD_SZ=head_sz,
-    #     HEAD_SZ_POW2=head_sz_pow2,
-    #     QUERY_GRP_SZ=query_grp_sz,
-    #     QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
-    #     KV_BLK_SZ=kv_blk_sz,
-    #     KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-    #     SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-    # )
-    # print(input_config)
+    output = output.reshape(batch_size, num_kv_heads * query_grp_sz, head_sz)
+    print(f"query.shape={query.shape}")
+    print(f"key_cache.shape={key_cache.shape}")
+    print(f"value_cache.shape={value_cache.shape}")
+    print(f"output.shape={output.shape}")
+    print(f"block_tables.shape={block_tables.shape}")
+    print(f"query.dtype={query.dtype}")
+    print(f"key_cache.dtype={key_cache.dtype}")
+    print(f"value_cache.dtype={value_cache.dtype}")
+    print(f"output.dtype={output.dtype}")
+    print(f"block_tables.dtype={block_tables.dtype}")
+    print(f"value_cache.stride()={value_cache.stride()}")
+    print(f"output.stride()={output.stride()}")
+    input_config = dict(
+        qlen=qlen,
+        kv_type=compute_type,
+        compute_type=compute_type,
+        HEAD_SZ=head_sz,
+        HEAD_SZ_POW2=head_sz_pow2,
+        QUERY_GRP_SZ=query_grp_sz,
+        QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
+        KV_BLK_SZ=kv_blk_sz,
+        KV_BLK_SZ_POW2=kv_blk_sz_pow2,
+        SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+    )
+    print(input_config)
 
     _, decode_time = _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         grid,
@@ -730,6 +1008,7 @@ def paged_attention_decode(
         KV_BLK_SZ=kv_blk_sz,
         KV_BLK_SZ_POW2=kv_blk_sz_pow2,
         SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+        TRANS_V=trans_v,
     )
 
     grid = (num_seqs, num_kv_heads, 1)
@@ -757,6 +1036,7 @@ def paged_attention_decode(
         MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
         MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
     )
+    output = output.reshape(batch_size * qlen, num_kv_heads * query_grp_sz // qlen, head_sz)
 
     # decode_time = 0
     # reduce_time = 0

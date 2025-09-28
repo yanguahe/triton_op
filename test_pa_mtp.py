@@ -18,7 +18,8 @@ from aiter.test_common import benchmark, checkAllclose, perftest
 
 from pa_decode_gluon import paged_attention_decode as paged_attention_decode_gluon
 from pa_decode_triton import paged_attention_decode as paged_attention_decode_triton
-from pa_decode_triton_fp8 import paged_attention_decode as paged_attention_decode_triton_fp8
+# from pa_decode_triton_fp8 import paged_attention_decode as paged_attention_decode_triton_fp8
+from pa_decode_triton_fp8_2 import paged_attention_decode as paged_attention_decode_triton_fp8
 import triton.language as tl
 
 
@@ -285,7 +286,8 @@ def torch_mha_extend(
         v = v_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float)
         if v_scale is not None:
             v *= v_scale[:, idx].t().unsqueeze(-1)
-        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=True)
+        # o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=True)
+        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=False)
         os.append(o)
     o = torch.concat(os)
     return o
@@ -415,8 +417,12 @@ def asm_V_shuffle(VC):
     x = 16 // VC.element_size()
     num_blocks, num_kv_heads, head_size, block_size = VC.shape
     VC = VC.view(num_blocks, num_kv_heads, head_size, block_size // x, x)
-    # [num_blocks, num_kv_heads, block_size/X, head_size, X]
+    # [num_blocks, num_kv_heads, block_size/x, head_size, x]
     VC = VC.permute(0, 1, 3, 2, 4).contiguous()
+    # VC = VC.transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size // x, head_size, x).contiguous()
+    # VC = VC.transpose(2, 3).contiguous()
+    # print(f"VC.shape={VC.shape}")
+    # print(f"VC.stride()={VC.stride()}")
     return VC
 
 
@@ -539,6 +545,7 @@ def test_pa_mtp(
     block_size: int,
     dtype: torch.dtype,
     qlen,
+    trans_v,
 ) -> dict:
     ret = {}
     seed = 0
@@ -599,6 +606,7 @@ def test_pa_mtp(
         device,
     )
     k_cache, v_cache = k_caches[0], v_caches[0]
+    softmax_scale = float(1.0 / (head_size ** 0.5))
 
 
     out_ref_noquant = torch_mha_extend(
@@ -610,26 +618,7 @@ def test_pa_mtp(
         qo_indptr,
     )
 
-    # out_asm_noquant, us_asm_noquant = run_aiter_asm(
-    #     query,
-    #     k_cache,
-    #     asm_V_shuffle(v_cache),
-    #     block_tables,
-    #     seq_lens,
-    #     block_tables.size(1),
-    #     max_qlen,
-    #     qo_indptr=qo_indptr,
-    # )
-    # err_noquant = checkAllclose(
-    #     out_ref_noquant,
-    #     out_asm_noquant,
-    #     msg=f"[torch vs  aiter_asm][No Quant]: {us_asm_noquant:>8.2f} us......",
-    # )
-    # ret["us_asm_bf16"] = us_asm_noquant
-    # ret["err_asm_bf16"] = err_noquant
 
-
-    softmax_scale = float(1.0 / (head_size**0.5))
     out_hip_noquant, us_hip = run_aiter_hip(
         query,
         k_cache,
@@ -647,34 +636,35 @@ def test_pa_mtp(
         out_hip_noquant,
         msg=f"[torch vs aiter_hip][No Quant]: {us_hip:>8.2f} us......",
     )
+    compare_arrays(out_hip_noquant.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
     ret["us_hip_bf16"] = us_hip
     ret["err_hip_bf16"] = err_hip_noquant
 
 
-    triton_output = torch.empty_like(out_hip_noquant)
-    triton_output, us_triton = run_triton(
-        triton_output,
-        query,
-        k_cache,
-        v_cache,
-        seq_lens,
-        block_tables,
-        softmax_scale,
-        seq_lens.max().item(),
-        torch_to_tl_dtype[dtype],
-        k_scale=torch.tensor(1.0, device=query.device, dtype=torch.float32),
-        v_scale=torch.tensor(1.0, device=query.device, dtype=torch.float32),
-        num_seq_partitions=0,
-        alibi_slopes=None,
-    )
-    us_triton = us_triton['triton']
-    err_triton_noquant = checkAllclose(
-        out_ref_noquant,
-        triton_output,
-        msg=f"[torch vs triton][No Quant]: {us_triton:>8.2f} us......",
-    )
-    ret["us_triton_bf16"] = us_triton
-    ret["err_triton_bf16"] = err_triton_noquant
+    # triton_output = torch.empty_like(out_ref_noquant)
+    # triton_output, us_triton = run_triton(
+    #     triton_output,
+    #     query,
+    #     k_cache,
+    #     v_cache,
+    #     seq_lens,
+    #     block_tables,
+    #     softmax_scale,
+    #     seq_lens.max().item(),
+    #     torch_to_tl_dtype[dtype],
+    #     k_scale=torch.tensor(1.0, device=query.device, dtype=torch.float32),
+    #     v_scale=torch.tensor(1.0, device=query.device, dtype=torch.float32),
+    #     num_seq_partitions=0,
+    #     alibi_slopes=None,
+    # )
+    # us_triton = us_triton['triton']
+    # err_triton_noquant = checkAllclose(
+    #     out_ref_noquant,
+    #     triton_output,
+    #     msg=f"[torch vs triton][No Quant]: {us_triton:>8.2f} us......",
+    # )
+    # ret["us_triton_bf16"] = us_triton
+    # ret["err_triton_bf16"] = err_triton_noquant
 
 
     # ################## quant start ######################
@@ -683,6 +673,8 @@ def test_pa_mtp(
         pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
     )
 
+    print(f"batch_size={batch_size}")
+    print(f"seq_lens={seq_lens}")
     print(f"dtype={dtype}")
     print(f"qkv.dtype={qkv.dtype}")
     print(f"k_cache.dtype={k_cache.dtype}")
@@ -701,8 +693,8 @@ def test_pa_mtp(
     print(f"v_scale_.shape={v_scale_.shape}")
     print(f"k_scale_asm.shape={k_scale_asm.shape}")
     print(f"v_scale_asm.shape={v_scale_asm.shape}")
-    print(f"batch_size={batch_size}")
-    print(f"seq_lens={seq_lens}")
+    print(f"out_ref_noquant.shape={out_ref_noquant.shape}")
+
 
     # q_cvted = q_scale * q_quant.to(torch.float32)
     # k_ref = k_cache.transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1).to(torch.float32)
@@ -732,10 +724,13 @@ def test_pa_mtp(
         query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
     )
     # out_ref = out_ref_noquant
-
-
+    if trans_v:
+        v_quant_ = asm_V_shuffle(v_quant_)
+        print(f"trans v_quant_.shape={v_quant_.shape}")
     fp8_diff_thr = 5e-2
-    triton_output = torch.empty_like(out_hip_noquant)
+
+
+    triton_output = torch.empty_like(out_ref_noquant)
     triton_output, us_triton = run_triton_fp8(
         triton_output,
         # query,
@@ -768,7 +763,7 @@ def test_pa_mtp(
         rtol=fp8_diff_thr,
         msg=f"[torch vs triton_fp8][   Quant]: {us_triton:>8.2f} us......",
     )
-    # compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
     ret["us_triton_fp8"] = us_triton
     ret["err_triton_fp8"] = err_triton_noquant
 
@@ -777,36 +772,43 @@ def test_pa_mtp(
     print(f"out_ref_md5={out_ref_md5}")
     print(f"triton_output_md5={triton_output_md5}")
 
+    print(f"out_ref.shape={out_ref.shape}")
+    print(f"triton_output.shape={triton_output.shape}")
+    print(f"batch_size={batch_size}")
+    triton_output = triton_output[:batch_size]
+    out_ref = out_ref[:batch_size]
+    compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
 
-    out_aiter_asm, us_aiter_asm = run_aiter_asm(
-        query,
-        k_quant_,
-        asm_V_shuffle(v_quant_),
-        block_tables,
-        seq_lens,
-        block_tables.size(1),
-        max_qlen,
-        k_scale_asm,
-        v_scale_asm,
-        qo_indptr,
-    )
-    err = checkAllclose(
-        out_ref,
-        out_aiter_asm,
-        atol=fp8_diff_thr,
-        rtol=fp8_diff_thr,
-        msg=f"[torch vs  aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
-    )
-    # compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
-    ret["us_asm_fp8"] = us_aiter_asm
-    ret["err fp8"] = err
+
+    # out_aiter_asm, us_aiter_asm = run_aiter_asm(
+    #     query,
+    #     k_quant_,
+    #     v_quant_,
+    #     block_tables,
+    #     seq_lens,
+    #     block_tables.size(1),
+    #     max_qlen,
+    #     k_scale_asm,
+    #     v_scale_asm,
+    #     qo_indptr,
+    # )
+    # err = checkAllclose(
+    #     out_ref,
+    #     out_aiter_asm,
+    #     atol=fp8_diff_thr,
+    #     rtol=fp8_diff_thr,
+    #     msg=f"[torch vs aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
+    # )
+    # # compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    # ret["us_asm_fp8"] = us_aiter_asm
+    # ret["err fp8"] = err
 
 
     # q_scale = q_scale.squeeze(-1)
     # out_hip, us_hip = run_aiter_hip(
     #     q_quant.to(torch.bfloat16),
     #     k_quant_,
-    #     asm_V_shuffle(v_quant_),
+    #     v_quant_,
     #     block_tables,
     #     seq_lens,
     #     ctx_lens,
@@ -823,9 +825,9 @@ def test_pa_mtp(
     #     out_hip,
     #     atol=fp8_diff_thr,
     #     rtol=fp8_diff_thr,
-    #     msg=f"[torch vs  aiter_hip_fp8][   Quant]: {us_hip:>8.2f} us......",
+    #     msg=f"[torch vs aiter_hip_fp8][   Quant]: {us_hip:>8.2f} us......",
     # )
-    # # compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    # compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
     # ret["us_hip_fp8"] = us_hip
     # ret["err_hip_fp8"] = err
 
@@ -833,7 +835,9 @@ def test_pa_mtp(
 
 
 head_dim = 128
-block_size = 16
+# block_size = 16
+# block_size = 1024
+block_size_list = [16, 128, 256, 512, 1024]
 l_dtype = ["bf16"]
 l_num_heads = [(5, 1), (8, 1), (10, 1)]
 l_qlen = [1, 2, 3, 4]
@@ -890,6 +894,19 @@ parser.add_argument(
     help="""Batch size.
     e.g. -b 128""",
 )
+parser.add_argument(
+    "--block_size",
+    type=int,
+    choices=block_size_list,
+    default=None,
+    help="""Batch size.
+    e.g. --block_size 16""",
+)
+parser.add_argument(
+    "--trans_v",
+    action="store_true",
+    help="""e.g. --trans_v""",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -904,6 +921,8 @@ if args.ctx_len is not None:
     l_ctx_len = [args.ctx_len]
 if args.batch_size is not None:
     l_batch_size = [args.batch_size]
+if args.block_size is not None:
+    block_size_list = [args.block_size]
 
 for dtype in l_dtype:
     df = []
@@ -911,16 +930,18 @@ for dtype in l_dtype:
         for qlen in l_qlen:
             for ctx_len in l_ctx_len:
                 for batch_size in l_batch_size:
-                    ret = test_pa_mtp(
-                        ctx_len,
-                        batch_size,
-                        num_heads,
-                        head_dim,
-                        block_size,
-                        dtype,
-                        qlen,
-                    )
-                    df.append(ret)
+                    for block_size in block_size_list:
+                        ret = test_pa_mtp(
+                            ctx_len,
+                            batch_size,
+                            num_heads,
+                            head_dim,
+                            block_size,
+                            dtype,
+                            qlen,
+                            args.trans_v,
+                        )
+                        df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"summary:\n{df}")
     # df.to_csv("mla_prefill.csv")

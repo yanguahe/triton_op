@@ -580,29 +580,29 @@ def paged_attention_decode(
     else:
         query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
 
-    print(f"query.shape={query.shape}")
-    print(f"key_cache.shape={key_cache.shape}")
-    print(f"value_cache.shape={value_cache.shape}")
-    print(f"output.shape={output.shape}")
-    print(f"block_tables.shape={block_tables.shape}")
-    print(f"query.dtype={query.dtype}")
-    print(f"key_cache.dtype={key_cache.dtype}")
-    print(f"value_cache.dtype={value_cache.dtype}")
-    print(f"output.dtype={output.dtype}")
-    print(f"block_tables.dtype={block_tables.dtype}")
-    input_config = dict(
-        qlen=qlen,
-        kv_type=compute_type,
-        compute_type=compute_type,
-        HEAD_SZ=head_sz,
-        HEAD_SZ_POW2=head_sz_pow2,
-        QUERY_GRP_SZ=query_grp_sz,
-        QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
-        KV_BLK_SZ=kv_blk_sz,
-        KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-        SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-    )
-    print(input_config)
+    # print(f"query.shape={query.shape}")
+    # print(f"key_cache.shape={key_cache.shape}")
+    # print(f"value_cache.shape={value_cache.shape}")
+    # print(f"output.shape={output.shape}")
+    # print(f"block_tables.shape={block_tables.shape}")
+    # print(f"query.dtype={query.dtype}")
+    # print(f"key_cache.dtype={key_cache.dtype}")
+    # print(f"value_cache.dtype={value_cache.dtype}")
+    # print(f"output.dtype={output.dtype}")
+    # print(f"block_tables.dtype={block_tables.dtype}")
+    # input_config = dict(
+    #     qlen=qlen,
+    #     kv_type=compute_type,
+    #     compute_type=compute_type,
+    #     HEAD_SZ=head_sz,
+    #     HEAD_SZ_POW2=head_sz_pow2,
+    #     QUERY_GRP_SZ=query_grp_sz,
+    #     QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
+    #     KV_BLK_SZ=kv_blk_sz,
+    #     KV_BLK_SZ_POW2=kv_blk_sz_pow2,
+    #     SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+    # )
+    # print(input_config)
 
     _, decode_time = _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         grid,
