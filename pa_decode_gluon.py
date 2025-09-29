@@ -128,7 +128,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         warps_per_cta   =[4, 1],
         order           =[1, 0],
     )
-    # shared_a_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[1, 0])
+    # shared_q_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[1, 0])
+    shared_q_layout: gl.constexpr = gl.SwizzledSharedLayout(16, 1, 8, order=[1, 0])
     # MAX_NUM_KV_BLKS x K_HEAD_SZ_POW2_SPLIT x KV_BLK_SZ_POW2 x CONTIGUOUS_KV_ELEMS_16B_LOAD
     # 16 x 16 x 16 x 8 x fp16   or   16 x 8 x 16 x 16 x fp16
     blocked_k0: gl.constexpr = gl.BlockedLayout(
@@ -137,17 +138,31 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         warps_per_cta   =[4, 1, 1, 1],
         order           =[3, 2, 1, 0],
     )
-    blocked_k1: gl.constexpr = gl.DistributedLinearLayout( # fp16
+    blocked_k10: gl.constexpr = gl.DistributedLinearLayout( # fp16
         reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,1,0,0), (0,8,0,0), (4,0,0,0), (8,0,0,0)), # 16 x 8
         lane_bases=((0,0,1,0), (0,0,2,0), (0,0,4,0), (0,0,8,0), (0,2,0,0), (0,4,0,0)), # 64
         warp_bases=((1,0,0,0), (2,0,0,0)), # 4
         block_bases=[], # 8
         shape=[16, 16, 16, 8],
     )
-    blocked_k2: gl.constexpr = gl.DistributedLinearLayout( # fp8
+    blocked_k1: gl.constexpr = gl.DistributedLinearLayout( # fp16
+        reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,0,1,0), (0,1,0,0), (0,8,0,0), (8,0,0,0)), # 16 x 8
+        lane_bases=((0,0,2,0), (0,0,4,0), (0,0,8,0), (1,0,0,0), (0,2,0,0), (0,4,0,0)), # 64
+        warp_bases=((2,0,0,0), (4,0,0,0)), # 4
+        block_bases=[], # 8
+        shape=[16, 16, 16, 8],
+    )
+    blocked_k20: gl.constexpr = gl.DistributedLinearLayout( # fp8
         reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,0,0,8), (0,4,0,0), (4,0,0,0), (8,0,0,0)), # 16 x 8
         lane_bases=((0,0,1,0), (0,0,2,0), (0,0,4,0), (0,0,8,0), (0,1,0,0), (0,2,0,0)), # 64
         warp_bases=((1,0,0,0), (2,0,0,0)), # 4
+        block_bases=[], # 8
+        shape=[16, 8, 16, 16],
+    )
+    blocked_k2: gl.constexpr = gl.DistributedLinearLayout( # fp8
+        reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,0,0,8), (0,0,1,0), (0,4,0,0), (8,0,0,0)), # 16 x 8
+        lane_bases=((0,0,2,0), (0,0,4,0), (0,0,8,0), (1,0,0,0), (0,1,0,0), (0,2,0,0)), # 64
+        warp_bases=((2,0,0,0), (4,0,0,0)), # 4
         block_bases=[], # 8
         shape=[16, 8, 16, 16],
     )
@@ -164,6 +179,13 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     )
     qk_rhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=qk_mfma_layout, k_width=16
+    )
+    qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout( # fp8
+        reg_bases=((0,1), (0,2), (0,4), (0,128)), # 16 x 8
+        lane_bases=((1,0), (2,0), (4,0), (8,0), (0,8), (0,16)), # 64
+        warp_bases=((0,32), (0,64)), # 4
+        block_bases=[], # 8
+        shape=[16, 256],
     )
 
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -201,8 +223,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     contiguous_kv_elems_offs = gl.arange(0, CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=contiguous_kv_elems_layout)
 
     kv_blk_start = seq_part_idx * MAX_NUM_KV_BLKS
-    qk_row_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
-    qk_col_offs = kv_blk_start + gl.arange(0, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, qk_mfma_layout))
+    qk_row_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_linear_layout))
+    qk_col_offs = kv_blk_start + gl.arange(0, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, qk_linear_layout))
 
     # load alibi slopes[QUERY_GRP_SZ_POW2]
     if alibi_slopes is None:
@@ -244,8 +266,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs, mask=q_mask)
     # q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs)
     q = (q * scale).to(compute_type)
-    # q_shared = gl.allocate_shared_memory(q.dtype, q.shape, shared_a_layout, q)
-
+    # q_shared = gl.allocate_shared_memory(q.dtype, q.shape, shared_q_layout, q)
     # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
     k_blk_offs = (
         kv_blk_nums[:, None, None, None] * stride_k_b
@@ -271,9 +292,13 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     k = k_0.to(gl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
     k = k.to(compute_type)
     # (MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD) --> (K_HEAD_SZ_POW2_SPLIT, CONTIGUOUS_KV_ELEMS_16B_LOAD, MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2)
-    kt_temp = tl.permute(k, [1, 3, 0, 2])
+    kt = gl.reshape(k, [MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2//2, 2, CONTIGUOUS_KV_ELEMS_16B_LOAD])
+    kt_temp = gl.permute(kt, [1, 4, 0, 2, 3])
+    kt = gl.reshape(kt_temp, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2 // 2, 2])
+    kt0, kt1 = gl.split(kt)
+    # kt_temp = gl.permute(k, [1, 3, 0, 2])
     # k[HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
-    kt = tl.reshape(kt_temp, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
+    # kt = gl.reshape(kt_temp, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
     # # (MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD) --> (MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, CONTIGUOUS_KV_ELEMS_16B_LOAD, KV_BLK_SZ_POW2)
     # kt_temp = tl.permute(k, [0, 1, 3, 2])
     # # k[MAX_NUM_KV_BLKS, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
@@ -283,11 +308,17 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # qk = gl.dot(q, kt, out_dtype=gl.float32)
     # qk[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     # qk = gl.dot(q, k, out_dtype=gl.float32)
-    accumulator = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2), dtype=gl.float32, layout=qk_mfma_layout)
+    accumulator0 = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2//2), dtype=gl.float32, layout=qk_mfma_layout)
+    accumulator1 = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2//2), dtype=gl.float32, layout=qk_mfma_layout)
     qc = gl.convert_layout(q, layout=qk_lhs_layout)
     # qc = q_shared.load(qk_lhs_layout)
-    kc = gl.convert_layout(kt, layout=qk_rhs_layout)
-    qk = gl.amd.cdna3.mfma(qc, kc, accumulator)
+    # kc = gl.convert_layout(kt, layout=qk_rhs_layout)
+    kc0 = gl.convert_layout(kt0, layout=qk_rhs_layout)
+    kc1 = gl.convert_layout(kt1, layout=qk_rhs_layout)
+    qk0 = gl.amd.cdna3.mfma(qc, kc0, accumulator0)
+    qk1 = gl.amd.cdna3.mfma(qc, kc1, accumulator1)
+    qk = gl.join(qk0, qk1)
+    qk = gl.reshape(qk, [QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
     # qk = qk.to(compute_type)
 
     # blk_seq_flatten_offs = gl.reshape(blk_seq_offs, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
@@ -314,7 +345,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     exp_sum = gl.sum(p, axis=1)
     p = p.to(compute_type)
 
-    m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
+    m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_linear_layout))
     m_l_offs = (
         seq_idx * stride_max_logits_s
         + kv_head_idx * stride_max_logits_nh
@@ -322,6 +353,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         + m_l_base_offs
     )
     m_l_grp_mask = m_l_base_offs < QUERY_GRP_SZ
+    tl.static_print(max_logit_new.type, m_l_offs.type)
     gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
     gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
 

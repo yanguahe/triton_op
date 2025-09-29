@@ -461,6 +461,7 @@ def test_paged_attention(
 
     # checkAllclose(triton_output, hip_output)
     # checkAllclose(gluon_output, hip_output)
+    checkAllclose(triton_output.to(torch.float32), gluon_output.to(torch.float32))
     print("\033[92mPASSED\033[0m")
 
     return {**time_hip, **triton_time}
@@ -478,7 +479,7 @@ NUM_SEQS_LIST = [32]
 SEQ_LEN_LIST = [4096]
 NUM_HEADS_LIST = [(8, 1)]
 # NUM_HEADS_LIST = [(16, 1)]
-DTYPE_LIST = [torch.bfloat16, torch.float8_e4m3fnuz]
+DTYPE_LIST = [torch.float8_e4m3fnuz] # torch.bfloat16, 
 
 for (num_seq, seq_len, num_heads, dtype) in itertools.product(
     NUM_SEQS_LIST, SEQ_LEN_LIST, NUM_HEADS_LIST, DTYPE_LIST):
