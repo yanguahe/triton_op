@@ -36,7 +36,9 @@ function copy_recent_amdgcn_files() {
     # dir_name=sparse_attn_fwd_kernel
     # dir_name=block_sparse_attn
     # dir_name=block_sparse_attn_lxoptv1
-    dir_name=pa_decode_v2_big_blk_fp8
+    # dir_name=pa_decode_v2_big_blk_fp8
+    dir_name=pa_decode_v2_fp8
+    # dir_name=pa_decode_v2_fp8_rtn
     # local k=2
     local k=200
     # local dest_dir=$PWD/thread_trace/triton_gen_asm
@@ -52,7 +54,8 @@ function copy_recent_amdgcn_files() {
     # kernel_name=_paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon
     # kernel_name=block_sparse_attn
     # kernel_name=sparse_attn
-    kernel_name=pa_decode_v2_big_blk_fp8
+    # kernel_name=pa_decode_v2_big_blk_fp8
+    kernel_name=pa_decode_v2_fp8
 
     # file_filter="*.amdgcn"
     file_filter="*$kernel_name*"
@@ -100,13 +103,6 @@ function run_triton_op {
     # export TRITON_ALWAYS_COMPILE=1
 
 
-    # pytest ./test_gluon.py::test_amd_mfma -v -s -k "3-8-bfloat16-128-128-32"
-    # pytest ./test_gluon.py::test_amd_mfma -v -s -k "3-8-bfloat16-16-16-32"
-    # pytest ./test_gluon.py::test_amd_mfma -v -s -k "3-8-bfloat16-32-32-16"
-
-    # pytest ./test_gemm_a8w8_blockscale.py::test_gemm -v -s
-    # pytest ./test_gemm_a8w8_blockscale.py::test_gemm -v -s -k "gluon-bf16-2048-8192-1024-NN-False"
-
     # ll ~/.triton/cache/*/*.hsaco
     # /opt/rocm/llvm/bin/clang++ -x assembler -mcode-object-version=5 -target amdgcn--amdhsa --offload-arch=gfx942 ./thread_trace/triton_gen_asm/block_sparse_attn/_triton_block_sparse_attn_fwd_kernel_v1.amdgcn -o /root/.triton/cache/VQ54VL322OSXBLRXJKYCSUKWTLMGD5SBDGBJUZMKHHO6CCS6PB5A/_triton_block_sparse_attn_fwd_kernel_v1.hsaco
     # /opt/rocm/llvm/bin/clang++ -x assembler -mcode-object-version=5 -target amdgcn--amdhsa --offload-arch=gfx942 ./thread_trace/triton_gen_asm/block_sparse_attn_lxoptv1/_triton_block_sparse_attn_fwd_kernel_v1.amdgcn -o /root/.triton/cache/FMGCXD6JK7RU6OEELBZHGQQNHHL4PSNEKXEVPM4KH7LU6KLILLIQ/_triton_block_sparse_attn_fwd_kernel_v1.hsaco
@@ -147,6 +143,7 @@ function run_triton_op {
 
     python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
 
+
     # python ./test_pa_mtp.py -n 5,1 -q 1 -c 57 -b 128 --block_size 16 --trans_v
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 4097 -b 32 --block_size 16 --trans_v
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 4096 -b 32 --block_size 16 --trans_v
@@ -169,13 +166,11 @@ function run_triton_op {
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 256 -b 32
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 257 -b 32
 
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 4097 -b 32
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 4096 -b 32
-
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 512 -b 32
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 513 -b 32
 
 
+    ll ~/.triton/cache/*/*.hsaco
     # md5sum ~/.triton/cache/*/*.hsaco
 
     # copy_recent_amdgcn_files

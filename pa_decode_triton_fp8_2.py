@@ -21,7 +21,6 @@ TEST_NUM_ITERS = 101
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 
 _SEQ_PARTITION_SIZE = 256  # HIP
-ttgir_file_path = os.path.join(os.path.dirname(__file__), "./ttgir/pa_noloop.ttgir")
 
 
 @triton.jit
@@ -35,7 +34,6 @@ def pa_decode_v2_big_blk_fp8_inner_one_q(
     kv_seq_len,
     alibi_slope,
     softmax_scale,
-    compute_type,
     log2e,
     max_logits_ptr,
     exp_sums_ptr,
@@ -52,6 +50,7 @@ def pa_decode_v2_big_blk_fp8_inner_one_q(
     seq_part_idx,
     k_cache_ptr,
     v_cache_ptr,
+    COMPUTE_TYPE: tl.constexpr,
     QID: tl.constexpr,
     QUERY_GRP_SZ: tl.constexpr,
     HEAD_SZ: tl.constexpr,
@@ -62,7 +61,7 @@ def pa_decode_v2_big_blk_fp8_inner_one_q(
     if k_cache_ptr.dtype.element_ty.is_fp8():
         q = q.to(k_cache_ptr.dtype.element_ty)
     else:
-        q = (q.to(tl.float32) * softmax_scale).to(compute_type)
+        q = (q.to(tl.float32) * softmax_scale).to(COMPUTE_TYPE)
 
     # qk[QUERY_GRP_SZ_POW2, SEQ_PARTITION_SZ]
     qk = tl.dot(q, k, out_dtype=tl.float32)
@@ -90,7 +89,7 @@ def pa_decode_v2_big_blk_fp8_inner_one_q(
     if v_cache_ptr.dtype.element_ty.is_fp8():
         p = p.to(v_cache_ptr.dtype.element_ty)
     else:
-        p = p.to(compute_type)
+        p = p.to(COMPUTE_TYPE)
 
     max_logits_offs = (
         seq_idx * stride_max_logits_s
@@ -105,7 +104,7 @@ def pa_decode_v2_big_blk_fp8_inner_one_q(
     # acc[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     acc = tl.dot(p, v, out_dtype=tl.float32)
     acc = acc / exp_sum[:, None]
-    acc = acc.to(compute_type)
+    acc = acc.to(COMPUTE_TYPE)
 
     # end up computation
     head_sz_offs = tl.arange(0, HEAD_SZ_POW2)
@@ -156,7 +155,7 @@ def pa_decode_v2_big_blk_fp8(
     kv_scale_stride0,
     kv_scale_stride1,
     Q_SEQ_LEN: tl.constexpr,
-    compute_type: tl.constexpr,
+    COMPUTE_TYPE: tl.constexpr,
     HEAD_SZ: tl.constexpr,
     HEAD_SZ_POW2: tl.constexpr,
     QUERY_GRP_SZ: tl.constexpr,
@@ -302,7 +301,7 @@ def pa_decode_v2_big_blk_fp8(
     if k_temp.dtype.is_fp8():
         k = k_temp
     else:
-        k = k_temp.to(compute_type)
+        k = k_temp.to(COMPUTE_TYPE)
 
     v = None
     if TRANS_V:
@@ -341,7 +340,7 @@ def pa_decode_v2_big_blk_fp8(
         v = v_scale_val * v.to(tl.float32)
         v = v.to(v_cache_ptr.dtype.element_ty)
     else:
-        v = v.to(compute_type)
+        v = v.to(COMPUTE_TYPE)
 
 
     # QID = 0
@@ -355,7 +354,6 @@ def pa_decode_v2_big_blk_fp8(
     #     kv_seq_len,
     #     alibi_slope,
     #     softmax_scale,
-    #     compute_type,
     #     log2e,
     #     max_logits_ptr,
     #     exp_sums_ptr,
@@ -372,6 +370,7 @@ def pa_decode_v2_big_blk_fp8(
     #     seq_part_idx,
     #     k_cache_ptr,
     #     v_cache_ptr,
+    #     COMPUTE_TYPE,
     #     QID,
     #     QUERY_GRP_SZ,
     #     HEAD_SZ,
@@ -386,7 +385,7 @@ def pa_decode_v2_big_blk_fp8(
     if k_temp.dtype.is_fp8():
         q = q.to(k_cache_ptr.dtype.element_ty)
     else:
-        q = (q.to(tl.float32) * softmax_scale).to(compute_type)
+        q = (q.to(tl.float32) * softmax_scale).to(COMPUTE_TYPE)
 
     # qk[QUERY_GRP_SZ_POW2, SEQ_PARTITION_SZ]
     qk = tl.dot(q, k, out_dtype=tl.float32)
@@ -420,7 +419,7 @@ def pa_decode_v2_big_blk_fp8(
         # p = v_scale_val * p
         p = p.to(v_cache_ptr.dtype.element_ty)
     else:
-        p = p.to(compute_type)
+        p = p.to(COMPUTE_TYPE)
 
     max_logits_offs = (
         seq_idx * stride_max_logits_s
@@ -435,7 +434,7 @@ def pa_decode_v2_big_blk_fp8(
     # acc[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     acc = tl.dot(p, v, out_dtype=tl.float32)
     acc = acc / exp_sum[:, None]
-    acc = acc.to(compute_type)
+    acc = acc.to(COMPUTE_TYPE)
 
     # end up computation
     logits_offs = seq_idx * stride_logits_s
@@ -454,7 +453,7 @@ def pa_decode_v2_big_blk_fp8(
         if k_temp.dtype.is_fp8():
             q = q.to(k_cache_ptr.dtype.element_ty)
         else:
-            q = (q.to(tl.float32) * softmax_scale).to(compute_type)
+            q = (q.to(tl.float32) * softmax_scale).to(COMPUTE_TYPE)
 
         # qk[QUERY_GRP_SZ_POW2, SEQ_PARTITION_SZ]
         qk = tl.dot(q, k, out_dtype=tl.float32)
@@ -482,7 +481,7 @@ def pa_decode_v2_big_blk_fp8(
         if v.dtype.is_fp8():
             p = p.to(v_cache_ptr.dtype.element_ty)
         else:
-            p = p.to(compute_type)
+            p = p.to(COMPUTE_TYPE)
 
         max_logits_offs = (
             seq_idx * stride_max_logits_s
@@ -497,7 +496,7 @@ def pa_decode_v2_big_blk_fp8(
         # acc[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
         acc = tl.dot(p, v, out_dtype=tl.float32)
         acc = acc / exp_sum[:, None]
-        acc = acc.to(compute_type)
+        acc = acc.to(COMPUTE_TYPE)
 
         logits_offs = seq_idx * stride_logits_s
         logits_offs += kv_head_idx * stride_logits_nh
@@ -549,7 +548,7 @@ def pa_decode_v2_fp8(
     kv_scale_stride0,
     kv_scale_stride1,
     Q_SEQ_LEN: tl.constexpr,
-    compute_type: tl.constexpr,
+    COMPUTE_TYPE: tl.constexpr,
     HEAD_SZ: tl.constexpr,
     HEAD_SZ_POW2: tl.constexpr,
     QUERY_GRP_SZ: tl.constexpr,
@@ -682,7 +681,7 @@ def pa_decode_v2_fp8(
         # q = q.to(tl.float8e4b8)
         k = k_temp
     else:
-        k = k_temp.to(compute_type)
+        k = k_temp.to(COMPUTE_TYPE)
 
     blk_seq_flatten_offs = tl.reshape(blk_seq_offs, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
     k_scale_val = k_scale
@@ -752,7 +751,7 @@ def pa_decode_v2_fp8(
         v = v_scale_val * v.to(tl.float32)
         v = v.to(v_cache_ptr.dtype.element_ty)
     else:
-        v = v.to(compute_type)
+        v = v.to(COMPUTE_TYPE)
 
 
     QID = 0
@@ -760,7 +759,7 @@ def pa_decode_v2_fp8(
     if k_temp.dtype.is_fp8():
         q = q.to(k_cache_ptr.dtype.element_ty)
     else:
-        q = (q.to(tl.float32) * softmax_scale).to(compute_type)
+        q = (q.to(tl.float32) * softmax_scale).to(COMPUTE_TYPE)
 
     # qk[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     qk = tl.dot(q, k, out_dtype=tl.float32)
@@ -794,7 +793,7 @@ def pa_decode_v2_fp8(
         # p = v_scale_val * p
         p = p.to(v_cache_ptr.dtype.element_ty)
     else:
-        p = p.to(compute_type)
+        p = p.to(COMPUTE_TYPE)
 
     max_logits_offs = (
         seq_idx * stride_max_logits_s
@@ -809,7 +808,7 @@ def pa_decode_v2_fp8(
     # acc[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     acc = tl.dot(p, v, out_dtype=tl.float32)
     acc = acc / exp_sum[:, None]
-    acc = acc.to(compute_type)
+    acc = acc.to(COMPUTE_TYPE)
 
     # end up computation
     logits_offs = seq_idx * stride_logits_s
@@ -828,7 +827,7 @@ def pa_decode_v2_fp8(
         if k_temp.dtype.is_fp8():
             q = q.to(k_cache_ptr.dtype.element_ty)
         else:
-            q = (q.to(tl.float32) * softmax_scale).to(compute_type)
+            q = (q.to(tl.float32) * softmax_scale).to(COMPUTE_TYPE)
 
         # qk[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
         qk = tl.dot(q, k, out_dtype=tl.float32)
@@ -861,7 +860,7 @@ def pa_decode_v2_fp8(
             # p = v_scale_val * p
             p = p.to(v_cache_ptr.dtype.element_ty)
         else:
-            p = p.to(compute_type)
+            p = p.to(COMPUTE_TYPE)
 
         max_logits_offs = (
             seq_idx * stride_max_logits_s
@@ -876,7 +875,7 @@ def pa_decode_v2_fp8(
         # acc[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
         acc = tl.dot(p, v, out_dtype=tl.float32)
         acc = acc / exp_sum[:, None]
-        acc = acc.to(compute_type)
+        acc = acc.to(COMPUTE_TYPE)
 
         logits_offs = seq_idx * stride_logits_s
         logits_offs += kv_head_idx * stride_logits_nh
@@ -1046,7 +1045,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     kv_scale_stride1,
     kv_type,
     Q_SEQ_LEN,
-    compute_type,
+    COMPUTE_TYPE,
     HEAD_SZ,
     HEAD_SZ_POW2,
     QUERY_GRP_SZ,
@@ -1060,46 +1059,49 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     # import pdb
     # pdb.set_trace()
 
-    # q_ptr = q_ptr.reshape(128, 2, 1, 5, 128)
-    # q_ptr = q_ptr.transpose(1, 2).reshape(128, 1 * 10, 128)
-
     # if 1:
     if 0:
+        # ttgir_file_path = os.path.join(os.path.dirname(__file__), "./ttgir/pa_noloop.ttgir")
+        ttgir_file_path = os.path.join(os.path.dirname(__file__), "./thread_trace/triton_gen_asm/pa_decode_v2_fp8/pa_decode_v2_fp8.ttgir")
+        # ttgir_file_path = os.path.join(os.path.dirname(__file__), "./thread_trace/triton_gen_asm/pa_decode_v2_fp8_rtn/pa_decode_v2_fp8.ttgir")
         with open(ttgir_file_path, 'r') as f:
             ttgir_content = f.read()
-
         try:
             compiled_kernel = compile_ttgir_with_triton(ttgir_content)
             compiled_kernel[grid](
-                exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-                max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-                logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-                q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
-                k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
-                v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-                blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
-                seq_lens_ptr,       # [num_seqs]
-                softmax_scale,
-                k_scale,
-                v_scale,
-                stride_max_logits_s,
-                stride_max_logits_nh,
-                stride_max_logits_p,
-                stride_logits_s,
-                stride_logits_nh,
-                stride_logits_p,
-                stride_logits_g,
-                stride_q_s,
-                stride_q_nh,
-                stride_k_b,
-                stride_k_nh,
-                stride_k_hz,
-                stride_k_bz,
-                stride_v_b,
-                stride_v_hz,
-                stride_v_bz,
-                stride_bt_s,
-            )
+            exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+            max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+            logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+            q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
+            k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+            v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+            blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
+            seq_lens_ptr,       # [num_seqs]
+            softmax_scale,
+            q_scale,            # [num_seqs, num_kv_heads * query_grp_sz, 1]
+            k_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
+            v_scale,            # [num_blks, num_kv_heads, kv_blk_sz, 1]
+            stride_max_logits_s,
+            stride_max_logits_nh,
+            stride_max_logits_p,
+            stride_logits_s,
+            stride_logits_nh,
+            stride_logits_p,
+            stride_logits_g,
+            stride_q_s,
+            stride_q_nh,
+            stride_k_b,
+            stride_k_nh,
+            stride_k_hz,
+            stride_k_bz,
+            stride_v_b,
+            stride_v_hz,
+            stride_v_bz,
+            stride_bt_s,
+            q_scale_stride0,
+            kv_scale_stride0,
+            kv_scale_stride1,
+        )
         except Exception as e:
             print(f"Compilation failed: {e}")
     else:
@@ -1142,7 +1144,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             kv_scale_stride0,
             kv_scale_stride1,
             Q_SEQ_LEN=Q_SEQ_LEN,
-            compute_type=compute_type,
+            COMPUTE_TYPE=COMPUTE_TYPE,
             HEAD_SZ=HEAD_SZ,
             HEAD_SZ_POW2=HEAD_SZ_POW2,
             QUERY_GRP_SZ=QUERY_GRP_SZ,
@@ -1291,7 +1293,7 @@ def paged_attention_decode(
     # input_config = dict(
     #     q_seq_len=q_seq_len,
     #     kv_type=compute_type,
-    #     compute_type=compute_type,
+    #     COMPUTE_TYPE=compute_type,
     #     HEAD_SZ=head_sz,
     #     HEAD_SZ_POW2=head_sz_pow2,
     #     QUERY_GRP_SZ=equi_query_grp_sz,
@@ -1340,7 +1342,7 @@ def paged_attention_decode(
         k_scale.stride(1),
         kv_type=compute_type,
         Q_SEQ_LEN=q_seq_len,
-        compute_type=compute_type,
+        COMPUTE_TYPE=compute_type,
         HEAD_SZ=head_sz,
         HEAD_SZ_POW2=head_sz_pow2,
         QUERY_GRP_SZ=query_grp_sz,
