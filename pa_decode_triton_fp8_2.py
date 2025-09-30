@@ -175,6 +175,8 @@ def pa_decode_v2_big_blk_fp8(
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     seq_part_idx = tl.program_id(2)
+    # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 0:
+    #     print('Q_SEQ_LEN=', Q_SEQ_LEN)
 
     log2e: tl.constexpr = 1.4426950408889634
     # CONTIGUOUS_KV_ELEMS_16B_LOAD: tl.constexpr = 8
@@ -377,45 +379,6 @@ def pa_decode_v2_big_blk_fp8(
     #     Q_SEQ_LEN,
     #     IS_CAUSAL,
     # )
-
-    # QID = 1
-    # pa_decode_v2_big_blk_fp8_inner_one_q(
-    #     q1,
-    #     k,
-    #     k_scale_val,
-    #     v,
-    #     q_grp_offs,
-    #     blk_seq_offs,
-    #     kv_seq_len,
-    #     alibi_slope,
-    #     softmax_scale,
-    #     compute_type,
-    #     log2e,
-    #     max_logits_ptr,
-    #     exp_sums_ptr,
-    #     logits_ptr,
-    #     stride_max_logits_s,
-    #     stride_max_logits_nh,
-    #     stride_max_logits_p,
-    #     stride_logits_s,
-    #     stride_logits_nh,
-    #     stride_logits_p,
-    #     stride_logits_g,
-    #     seq_idx,
-    #     kv_head_idx,
-    #     seq_part_idx,
-    #     k_cache_ptr,
-    #     v_cache_ptr,
-    #     QID,
-    #     QUERY_GRP_SZ,
-    #     HEAD_SZ,
-    #     HEAD_SZ_POW2,
-    #     Q_SEQ_LEN,
-    #     IS_CAUSAL,
-    # )
-
-    # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 0:
-    #     print('Q_SEQ_LEN=', Q_SEQ_LEN)
 
 
     QID = 0
@@ -747,7 +710,6 @@ def pa_decode_v2_fp8(
     v = None
     if TRANS_V:
         # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 0:
-        #     print('****************************TRANS_V****************************')
         #     print('CONTIGUOUS_KV_ELEMS_16B_LOAD=', CONTIGUOUS_KV_ELEMS_16B_LOAD)
         blk_sz_div_offs = tl.arange(0, KV_BLK_SZ_POW2 // CONTIGUOUS_KV_ELEMS_16B_LOAD)
         # [MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2/x, HEAD_SZ_POW2, x]
@@ -767,8 +729,6 @@ def pa_decode_v2_fp8(
         v = tl.permute(v, [0, 2, 1])
         v = tl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
     else:
-        # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 0:
-        #     print('****************************NOT TRANS_V****************************')
         # v_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
         v_blk_offs = (
             kv_blk_nums[:, None, None] * stride_v_b
@@ -1264,8 +1224,6 @@ def paged_attention_decode(
     """
     #TODO: Add Doc
     """
-
-    # get num_seqs, num_kv_heads, kv_blk_sz, head_sz and query_grp_sz
     batch_size = block_tables.shape[0]
     num_seqs = query.shape[0]
     num_q_heads = query.shape[1]
@@ -1277,21 +1235,12 @@ def paged_attention_decode(
     kv_blk_sz = key_cache.shape[-2]
     query_grp_sz = num_q_heads // num_kv_heads
     equi_query_grp_sz = q_seq_len * query_grp_sz
-    # equi_query_grp_sz = query_grp_sz
     equi_query_grp_sz_pow2 = triton.next_power_of_2(equi_query_grp_sz)
     kv_blk_sz_pow2 = triton.next_power_of_2(kv_blk_sz)
     head_sz_pow2 = triton.next_power_of_2(head_sz)
     is_causal = q_seq_len > 1
     # is_causal = False
-
-    # query = query.reshape(batch_size, q_seq_len, num_kv_heads, query_grp_sz, head_sz)
-    # query = query.transpose(1, 2).reshape(batch_size, num_kv_heads * equi_query_grp_sz, head_sz)
-    # num_seqs = query.shape[0]
     num_seqs = batch_size
-
-    # if q_scale is not None and len(q_scale.shape) == 3:
-    #     q_scale = q_scale.reshape(batch_size, q_seq_len, num_kv_heads, query_grp_sz, 1)
-    #     q_scale = q_scale.transpose(1, 2).reshape(batch_size, num_kv_heads * equi_query_grp_sz, 1)
 
     grid = (num_seqs, num_kv_heads, max_num_partitions)
     shape_info = (num_seqs, num_kv_heads, max_num_partitions, q_seq_len * query_grp_sz)
@@ -1353,8 +1302,6 @@ def paged_attention_decode(
     # )
     # print(input_config)
 
-    # queryt = query.reshape(batch_size, num_kv_heads, q_seq_len, query_grp_sz, head_sz)
-    # queryt = queryt.transpose(1, 2).reshape(batch_size * q_seq_len, num_kv_heads * query_grp_sz, head_sz)
 
     _, decode_time = _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         grid,
@@ -1405,136 +1352,6 @@ def paged_attention_decode(
         IS_CAUSAL=is_causal,
     )
 
-
-    # from utils import compare_arrays
-    # def run_decode_q0():
-    #     # select_q = query.reshape(128, 10, 128)[:, :5, :]
-    #     select_q = query.reshape(128, 10, 128)[:, 5:, :]
-    #     select_out = tmp_output[:, :, :, :5, :].contiguous()
-    #     select_q_scale = q_scale.reshape(128, 10, 1)[:, 5:, :].contiguous()
-    #     # select_q_scale = q_scale.reshape(128, 10, 1)[:, :5, :].contiguous()
-    #     # select_q_scale = q_scale
-    #     print(f"grid={grid}")
-    #     print(f"select_q.shape={select_q.shape}")
-    #     print(f"select_out.shape={select_out.shape}")
-    #     print(f"select_q.stride()={select_q.stride()}")
-    #     print(f"select_out.stride()={select_out.stride()}")
-    #     print(f"select_q_scale.stride()={select_q_scale.stride()}")
-    #     _, decode_time = _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
-    #         grid,
-    #         exp_sums,
-    #         max_logits,
-    #         select_out,
-    #         select_q,
-    #         key_cache,
-    #         value_cache,
-    #         block_tables,
-    #         seq_lens,
-    #         attn_scale,
-    #         select_q_scale,
-    #         k_scale,
-    #         v_scale,
-    #         alibi_slopes,
-    #         exp_sums.stride(0),
-    #         exp_sums.stride(1),
-    #         exp_sums.stride(2),
-    #         select_out.stride(0),
-    #         select_out.stride(1),
-    #         select_out.stride(2),
-    #         select_out.stride(3),
-    #         select_q.stride(0),
-    #         select_q.stride(1),
-    #         key_cache.stride(0),
-    #         key_cache.stride(1),
-    #         key_cache.stride(2),
-    #         key_cache.stride(3),
-    #         value_cache.stride(0),
-    #         value_cache.stride(1),
-    #         value_cache.stride(2),
-    #         block_tables.stride(0),
-    #         select_q_scale.stride(0),
-    #         k_scale.stride(0),
-    #         k_scale.stride(1),
-    #         kv_type=compute_type,
-    #         compute_type=compute_type,
-    #         HEAD_SZ=head_sz,
-    #         HEAD_SZ_POW2=head_sz_pow2,
-    #         QUERY_GRP_SZ=5,
-    #         QUERY_GRP_SZ_POW2=16,
-    #         KV_BLK_SZ=kv_blk_sz,
-    #         KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-    #         SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-    #         TRANS_V=trans_v,
-    #     )
-    #     return select_out
-
-    # def run_decode_q01():
-    #     select_q = query.reshape(128, 2, 5, 128).reshape(128, 10, 128).contiguous()
-    #     # select_q = query
-    #     select_out = tmp_output.clone()
-    #     select_q_scale = q_scale.reshape(128, 10, 1).contiguous()
-    #     # select_q_scale = q_scale
-    #     print(f"grid={grid}")
-    #     print(f"select_q.shape={select_q.shape}")
-    #     print(f"select_out.shape={select_out.shape}")
-    #     print(f"select_q.stride()={select_q.stride()}")
-    #     print(f"select_out.stride()={select_out.stride()}")
-    #     print(f"select_q_scale.stride()={select_q_scale.stride()}")
-    #     _, decode_time = _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
-    #         grid,
-    #         exp_sums,
-    #         max_logits,
-    #         select_out,
-    #         select_q,
-    #         key_cache,
-    #         value_cache,
-    #         block_tables,
-    #         seq_lens,
-    #         attn_scale,
-    #         select_q_scale,
-    #         k_scale,
-    #         v_scale,
-    #         alibi_slopes,
-    #         exp_sums.stride(0),
-    #         exp_sums.stride(1),
-    #         exp_sums.stride(2),
-    #         select_out.stride(0),
-    #         select_out.stride(1),
-    #         select_out.stride(2),
-    #         select_out.stride(3),
-    #         select_q.stride(0),
-    #         select_q.stride(1),
-    #         key_cache.stride(0),
-    #         key_cache.stride(1),
-    #         key_cache.stride(2),
-    #         key_cache.stride(3),
-    #         value_cache.stride(0),
-    #         value_cache.stride(1),
-    #         value_cache.stride(2),
-    #         block_tables.stride(0),
-    #         select_q_scale.stride(0),
-    #         k_scale.stride(0),
-    #         k_scale.stride(1),
-    #         kv_type=compute_type,
-    #         compute_type=compute_type,
-    #         HEAD_SZ=head_sz,
-    #         HEAD_SZ_POW2=head_sz_pow2,
-    #         QUERY_GRP_SZ=equi_query_grp_sz,
-    #         QUERY_GRP_SZ_POW2=equi_query_grp_sz_pow2,
-    #         KV_BLK_SZ=kv_blk_sz,
-    #         KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-    #         SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-    #         TRANS_V=trans_v,
-    #     )
-    #     return select_out
-
-    # out0 = run_decode_q0()
-    # out01 = run_decode_q01()
-    # # sliced_out = out01[:, :, :, :5, :]
-    # sliced_out = out01[:, :, :, 5:, :]
-    # compare_arrays(out0.to(torch.float32).detach().cpu().numpy(), sliced_out.to(torch.float32).detach().cpu().numpy())
-
-
     grid = (num_seqs, num_kv_heads, 1)
     _, reduce_time = _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
         grid,
@@ -1565,12 +1382,11 @@ def paged_attention_decode(
 
     tmp_output_nan_cnt = torch.isnan(tmp_output).sum()
     output_nan_cnt = torch.isnan(output).sum()
-    print(f"tmp_output_nan_cnt={tmp_output_nan_cnt}")
-    print(f"output_nan_cnt={output_nan_cnt}")
+    # print(f"tmp_output_nan_cnt={tmp_output_nan_cnt}")
+    # print(f"output_nan_cnt={output_nan_cnt}")
 
     # decode_time = 0
     # reduce_time = 0
-    # print(f"triton:\n{tmp_output[0]}")
 
     return {'triton_decode': decode_time,
             'triton_reduce': reduce_time,

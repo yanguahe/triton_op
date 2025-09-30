@@ -34,7 +34,7 @@ _SEQ_PARTITION_SIZE = 256  # HIP
 ttgir_file_path = os.path.join(os.path.dirname(__file__), "./ttgir/pa_noloop.ttgir")
 
 THREADS_PER_WARP = triton.runtime.driver.active.get_current_target().warp_size
-print(f"THREADS_PER_WARP={THREADS_PER_WARP}")
+# print(f"THREADS_PER_WARP={THREADS_PER_WARP}")
 
 
 def setup_seed(seed):

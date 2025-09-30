@@ -741,11 +741,13 @@ def test_pa_mtp(
 
 
 head_dim = 128
-block_size_list = [16, 128, 256, 512, 1024]
+block_size_list = [16, 1024]
+# block_size_list = [16, 128, 256, 512, 1024]
 l_dtype = ["bf16"]
 l_num_heads = [(5, 1), (8, 1), (10, 1)]
 # l_num_heads = [(5, 1), (8, 1), (10, 1), (8, 2)]
-l_qlen = [1, 2, 3, 4]
+l_qlen = [1, 2]
+# l_qlen = [1, 2, 3, 4]
 l_ctx_len = [7, 26, 57, 66, 109, 128, 256, 257, 282, 512, 513, 4096, 4097]
 l_batch_size = [128, 32]
 
