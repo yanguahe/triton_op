@@ -21,7 +21,6 @@ TEST_NUM_ITERS = 101
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 
 _SEQ_PARTITION_SIZE = 256  # HIP
-ttgir_file_path = os.path.join(os.path.dirname(__file__), "./ttgir/pa_noloop.ttgir")
 
 
 @triton.jit
@@ -390,6 +389,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
 
     # if 1:
     if 0:
+        # ttgir_file_path = os.path.join(os.path.dirname(__file__), "./ttgir/pa_noloop.ttgir")
+        ttgir_file_path = os.path.join(os.path.dirname(__file__), "./ttgir/pa_implicit_convert_use_v2.ttgir")
         with open(ttgir_file_path, 'r') as f:
             ttgir_content = f.read()
 
@@ -615,8 +616,8 @@ def paged_attention_decode(
         block_tables,
         seq_lens,
         attn_scale,
-        k_scale,
-        v_scale,
+        k_scale.item(),
+        v_scale.item(),
         alibi_slopes,
         exp_sums.stride(0),
         exp_sums.stride(1),

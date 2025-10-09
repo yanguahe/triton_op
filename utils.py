@@ -92,13 +92,13 @@ def compare_arrays(arr1: np.ndarray, arr2: np.ndarray,
         'percentage': 100 * count / total_elements
     })
 
-    print("\nTop differences:")
-    for item in result['top_k_diff']:
-        print(f"Position {item['position']}: arr1 = {arr1[item['position']]:.6f}, arr2 = {arr2[item['position']]:.6f}, Diff = {item['value']:.6f}")
+    # print("\nTop differences:")
+    # for item in result['top_k_diff']:
+    #     print(f"Position {item['position']}: arr1 = {arr1[item['position']]:.6f}, arr2 = {arr2[item['position']]:.6f}, Diff = {item['value']:.6f}")
 
-    print("\nThreshold statistics:")
-    for stat in result['threshold_stats']:
-        print(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
+    # print("\nThreshold statistics:")
+    # for stat in result['threshold_stats']:
+    #     print(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
 
     print("\nNaN info:")
     print(result['nan_info'])

@@ -142,6 +142,11 @@ function run_triton_op {
 
 
     python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
+    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 1024
+
+    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 8192 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 8,1 -q 1 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 64,1 -q 1 --block_size 16
 
 
     # python ./test_pa_mtp.py -n 5,1 -q 1 -c 57 -b 128 --block_size 16 --trans_v
@@ -162,15 +167,16 @@ function run_triton_op {
 
 
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 7 -b 32
-
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 256 -b 32
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 257 -b 32
-
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 512 -b 32
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 513 -b 32
 
+    # rocprofv3 -i ./counters.yaml --kernel-include-regex "pa_decode_v2_fp8" --output-directory ./rocprofv3_out -- python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
+    # rocprofv3 -i ./counters.yaml --kernel-include-regex "_paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk" --output-directory ./rocprofv3_out -- python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
+    # rocprofv3 -i ./counters.yaml --kernel-include-regex "paged_attention_ll4mi_QKV_mfma16_kernel" --output-directory ./rocprofv3_out -- python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
 
-    ll ~/.triton/cache/*/*.hsaco
+    # ll ~/.triton/cache/*/*.hsaco
     # md5sum ~/.triton/cache/*/*.hsaco
 
     # copy_recent_amdgcn_files
