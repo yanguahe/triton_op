@@ -116,8 +116,8 @@ function run_triton_op {
     # python ./test_gluon_pa_qk_v1.py
     # python ./test_gluon_pa_qk_v2.py
     # python ./test_pa_decode_gluon_triton.py
-    # python ./test_pa_mtp.py -n 10,1 -q 2 -c 7 -b 32
 
+    # python ./test_pa_mtp.py -n 10,1 -q 2 -c 7 -b 32
     # python ./test_pa_mtp.py -n 8,2 -q 2 -c 57 -b 128 --block_size 1024 --trans_v
 
     # python ./test_pa_mtp.py -q 1 --block_size 16

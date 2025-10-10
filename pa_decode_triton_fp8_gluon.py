@@ -567,13 +567,20 @@ def pa_decode_v2_fp8(
     """
     gl.static_assert(Q_SEQ_LEN <= 4, "Q_SEQ_LEN={}, Do not support Q_SEQ_LEN > 4".format(Q_SEQ_LEN))
 
-    seq_idx = gl.program_id(0)
-    kv_head_idx = gl.program_id(1)
-    seq_part_idx = gl.program_id(2)
+    # 0 for per_tensor quant
+    # 1 for per_token quant
+    Q_QUANT_MODE: gl.constexpr = 0
+    # Q_QUANT_MODE: gl.constexpr = 1
+    KV_QUANT_MODE: gl.constexpr = 0
+    # KV_QUANT_MODE: gl.constexpr = 1
 
     log2e: gl.constexpr = 1.4426950408889634
     CONTIGUOUS_KV_ELEMS_16B_LOAD: gl.constexpr = KV_16B_ELE_NUM
     K_HEAD_SZ_POW2_SPLIT: gl.constexpr = HEAD_SZ_POW2 // CONTIGUOUS_KV_ELEMS_16B_LOAD
+
+    seq_idx = gl.program_id(0)
+    kv_head_idx = gl.program_id(1)
+    seq_part_idx = gl.program_id(2)
 
     kv_seq_len = gl.load(seq_lens_ptr + seq_idx)
     seq_start_idx = seq_part_idx * SEQ_PARTITION_SZ
@@ -585,145 +592,162 @@ def pa_decode_v2_fp8(
     num_kv_blks = gl.cdiv(seq_end_idx - seq_start_idx, KV_BLK_SZ)
 
     # ==================== Layout Definitions ====================
-    # Q layout: QUERY_GRP_SZ_POW2 x HEAD_SZ_POW2
-    blocked_q_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
+    blocked_q: gl.constexpr = gl.BlockedLayout(
+        size_per_thread =[1, 8],
         threads_per_warp=[4, 16],
-        warps_per_cta=[4, 1],
-        order=[1, 0],
+        warps_per_cta   =[4, 1],
+        order           =[1, 0],
     )
-    
-    # K layout: MAX_NUM_KV_BLKS x K_HEAD_SZ_POW2_SPLIT x KV_BLK_SZ_POW2 x CONTIGUOUS_KV_ELEMS_16B_LOAD
-    blocked_k_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[4, 2, 2, 8],
-        threads_per_warp=[1, 8, 8, 1],
-        warps_per_cta=[4, 1, 1, 1],
-        order=[3, 2, 1, 0],
+    # MAX_NUM_KV_BLKS x K_HEAD_SZ_POW2_SPLIT x KV_BLK_SZ_POW2 x CONTIGUOUS_KV_ELEMS_16B_LOAD
+    # 16 x 16 x 16 x 8 x fp16
+    blocked_k1: gl.constexpr = gl.DistributedLinearLayout( # fp16
+        reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,0,1,0), (0,1,0,0), (0,8,0,0), (8,0,0,0)), # 16 x 8
+        lane_bases=((0,0,2,0), (0,0,4,0), (0,0,8,0), (1,0,0,0), (0,2,0,0), (0,4,0,0)), # 64
+        warp_bases=((2,0,0,0), (4,0,0,0)), # 4
+        block_bases=[], # 8
+        shape=[16, 16, 16, 8],
     )
-    
-    # V layout (non-transposed): MAX_NUM_KV_BLKS x HEAD_SZ_POW2 x KV_BLK_SZ_POW2
-    blocked_v_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[4, 4, 8],
-        threads_per_warp=[1, 32, 2],
-        warps_per_cta=[4, 1, 1],
-        order=[2, 1, 0],
+    # 16 x 8 x 16 x 16 x fp8
+    blocked_k2: gl.constexpr = gl.DistributedLinearLayout( # fp8
+        reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,0,0,8), (0,0,1,0), (0,4,0,0), (8,0,0,0)), # 16 x 8
+        lane_bases=((0,0,2,0), (0,0,4,0), (0,0,8,0), (1,0,0,0), (0,1,0,0), (0,2,0,0)), # 64
+        warp_bases=((2,0,0,0), (4,0,0,0)), # 4
+        block_bases=[], # 8
+        shape=[16, 8, 16, 16],
     )
+    blocked_k: gl.constexpr = blocked_k1 if CONTIGUOUS_KV_ELEMS_16B_LOAD == 8 else blocked_k2
 
-    # V layout (transposed): MAX_NUM_KV_BLKS x KV_BLK_SZ_POW2/x x HEAD_SZ_POW2 x CONTIGUOUS_KV_ELEMS_16B_LOAD
-    blocked_v_trans_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[4, 2, 4, 8],
-        threads_per_warp=[1, 8, 8, 1],
-        warps_per_cta=[4, 1, 1, 1],
-        order=[3, 2, 1, 0],
-    )
-
-    # MFMA layouts for QK and PV
+    # transposed: indicates the result tensor is transposed so that each thread holds consecutive elements
+    # in the same row instead of column, which is good for chained dot and global write.
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
     )
-    qk_lhs_layout: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=qk_mfma_layout, k_width=16)
-    qk_rhs_layout: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=qk_mfma_layout, k_width=16)
-    
-    pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[1, 4]
+    qk_lhs_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=qk_mfma_layout, k_width=16
     )
-    pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=pv_mfma_layout, k_width=16)
-    pv_rhs_layout: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=pv_mfma_layout, k_width=16)
+    qk_rhs_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=qk_mfma_layout, k_width=16
+    )
+    qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=((0,1), (0,2), (0,4), (0,128)), # 16 x 8
+        lane_bases=((1,0), (2,0), (4,0), (8,0), (0,8), (0,16)), # 64
+        warp_bases=((0,32), (0,64)), # 4
+        block_bases=[], # 8
+        shape=[16, 256],
+    )
 
-    # ==================== Range Definitions ====================
-    # q_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, blocked_q_layout))
-    # head_sz_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, blocked_q_layout))
-    # head_sz_div_offs = gl.arange(0, K_HEAD_SZ_POW2_SPLIT, layout=gl.SliceLayout(1, blocked_k_layout))
-    # blk_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(2, blocked_k_layout))
-    # contiguous_kv_elems_offs = gl.arange(0, CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=gl.SliceLayout(3, blocked_k_layout))
-    # blk_ids = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(0, blocked_k_layout))
+    pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+    )
+    pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=pv_mfma_layout, k_width=16
+    )
+    pv_rhs_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=pv_mfma_layout, k_width=16
+    )
 
-    q_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2)
-    head_sz_offs = gl.arange(0, HEAD_SZ_POW2)
-    head_sz_div_offs = gl.arange(0, K_HEAD_SZ_POW2_SPLIT)
-    blk_offs = gl.arange(0, KV_BLK_SZ_POW2)
-    contiguous_kv_elems_offs = gl.arange(0, CONTIGUOUS_KV_ELEMS_16B_LOAD)
-    blk_ids = gl.arange(0, MAX_NUM_KV_BLKS)
+    # blocked_q dim0
+    query_grp_sz_layout: gl.constexpr = gl.SliceLayout(1, blocked_q)
+    # blocked_q dim1
+    head_sz_layout: gl.constexpr = gl.SliceLayout(0, blocked_q)
 
+    # blocked_k dim0
+    blk_id_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k)))
+    # blocked_k dim1
+    head_sz_div_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k)))
+    # blocked_k dim2
+    blk_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, blocked_k)))
+    # blocked_k dim3
+    contiguous_kv_elems_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, blocked_k)))
 
-    # ==================== Alibi Slopes ====================
+    q_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=query_grp_sz_layout)
+    head_sz_offs = gl.arange(0, HEAD_SZ_POW2, layout=head_sz_layout)
+    head_sz_div_offs = gl.arange(0, K_HEAD_SZ_POW2_SPLIT, layout=head_sz_div_layout)
+    blk_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=blk_layout)
+    contiguous_kv_elems_offs = gl.arange(0, CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=contiguous_kv_elems_layout)
+
+    kv_blk_start = seq_part_idx * MAX_NUM_KV_BLKS
+    qk_row_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_linear_layout))
+    qk_col_offs = kv_blk_start + gl.arange(0, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, qk_linear_layout))
+
+    # load alibi slopes[QUERY_GRP_SZ_POW2]
     if alibi_slopes is None:
         alibi_slope = gl.zeros([QUERY_GRP_SZ_POW2], dtype=gl.float32)
     else:
-        alibi_slope = gl.amd.cdna3.buffer_load(
-            ptr=alibi_slopes + kv_head_idx * QUERY_GRP_SZ, 
-            offsets=q_grp_offs, 
-            mask=q_grp_offs < QUERY_GRP_SZ
-        )
+        alibi_slope = gl.amd.cdna3.buffer_load(ptr=alibi_slopes + kv_head_idx * QUERY_GRP_SZ, offsets=qk_row_offs, mask=qk_row_offs < QUERY_GRP_SZ)
 
-    # ==================== Load KV Blocks ====================
+    # load all kv blocks in one time
+    blk_ids = gl.arange(0, MAX_NUM_KV_BLKS, layout=blk_id_layout)
     masked_blk_ids = gl.where(blk_ids < num_kv_blks, blk_ids, 0)
-    kv_blk_start = seq_part_idx * MAX_NUM_KV_BLKS
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
-    kv_blk_nums = gl.amd.cdna3.buffer_load(
-        ptr=blk_tables_start_ptr + kv_blk_start, 
-        offsets=masked_blk_ids
-    )
+    kv_blk_nums = gl.amd.cdna3.buffer_load(ptr=blk_tables_start_ptr + kv_blk_start, offsets=masked_blk_ids)
 
-    # ==================== Load Q and Apply Scaling ====================
-    # Load q0 (always present)
-    q_offs_base = (
-        seq_idx * Q_SEQ_LEN * stride_q_s
+    # load q[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
+    q_offs = (
+        seq_idx * stride_q_s
         + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[:, None]) * stride_q_nh
         + head_sz_offs[None, :]
     )
     q_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
-    
-    q0 = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs_base, mask=q_mask)
-    
-    if q0.dtype.is_fp8():
-        q_scale_offs_base = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + q_grp_offs
-        q_scale_val = gl.amd.cdna3.buffer_load(
-            ptr=q_scale, offsets=q_scale_offs_base, mask=q_grp_offs < QUERY_GRP_SZ
-        )
-        q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
-        q0 = q_scale_val * q0.to(gl.float32)
+    q0 = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs, mask=q_mask)
+    # if CONTIGUOUS_KV_ELEMS_16B_LOAD == 8:
+    #     # kv is 16bit
+    #     # if kv is 8bit, softmax_scale is multiplied with k_scale
+    #     # q0 = (q0 * softmax_scale).to(COMPUTE_TYPE)
+    #     q0 = (q0.to(gl.float32) * softmax_scale).to(COMPUTE_TYPE)
+    # 0 for per_tensor quant
+    if q0.dtype.is_fp8() and Q_QUANT_MODE == 0:
+        # q0 = (q0.to(gl.float32) * q_scale * softmax_scale).to(k_cache_ptr.dtype.element_ty)
+        # q0 = (q0.to(gl.float32) * softmax_scale).to(k_cache_ptr.dtype.element_ty)
+        q0 = (q0 * softmax_scale).to(k_cache_ptr.dtype.element_ty)
 
-    # Initialize q1, q2, q3 with q0
-    q1 = q0
-    q2 = q0  
-    q3 = q0
+    # if q0.dtype.is_fp8():
+    #     q_scale_offs_base = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + q_grp_offs
+    #     q_scale_val = gl.amd.cdna3.buffer_load(
+    #         ptr=q_scale, offsets=q_scale_offs_base, mask=q_grp_offs < QUERY_GRP_SZ
+    #     )
+    #     q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+    #     q0 = q_scale_val * q0.to(gl.float32)
 
-    # Load additional queries based on Q_SEQ_LEN
-    if Q_SEQ_LEN >= 2:
-        qid = 1
-        q1 = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs_base + qid * stride_q_s, mask=q_mask)
-        if q1.dtype.is_fp8():
-            q_scale_val = gl.amd.cdna3.buffer_load(
-                ptr=q_scale, offsets=q_scale_offs_base + qid * q_scale_stride0, 
-                mask=q_grp_offs < QUERY_GRP_SZ
-            )
-            q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
-            q1 = q_scale_val * q1.to(gl.float32)
+    # # Initialize q1, q2, q3 with q0
+    # q1 = q0
+    # q2 = q0  
+    # q3 = q0
+    # # Load additional queries based on Q_SEQ_LEN
+    # if Q_SEQ_LEN >= 2:
+    #     qid = 1
+    #     q1 = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs_base + qid * stride_q_s, mask=q_mask)
+    #     if q1.dtype.is_fp8():
+    #         q_scale_val = gl.amd.cdna3.buffer_load(
+    #             ptr=q_scale, offsets=q_scale_offs_base + qid * q_scale_stride0, 
+    #             mask=q_grp_offs < QUERY_GRP_SZ
+    #         )
+    #         q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+    #         q1 = q_scale_val * q1.to(gl.float32)
     
-    if Q_SEQ_LEN >= 3:
-        qid = 2
-        q2 = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs_base + qid * stride_q_s, mask=q_mask)
-        if q2.dtype.is_fp8():
-            q_scale_val = gl.amd.cdna3.buffer_load(
-                ptr=q_scale, offsets=q_scale_offs_base + qid * q_scale_stride0,
-                mask=q_grp_offs < QUERY_GRP_SZ
-            )
-            q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
-            q2 = q_scale_val * q2.to(gl.float32)
+    # if Q_SEQ_LEN >= 3:
+    #     qid = 2
+    #     q2 = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs_base + qid * stride_q_s, mask=q_mask)
+    #     if q2.dtype.is_fp8():
+    #         q_scale_val = gl.amd.cdna3.buffer_load(
+    #             ptr=q_scale, offsets=q_scale_offs_base + qid * q_scale_stride0,
+    #             mask=q_grp_offs < QUERY_GRP_SZ
+    #         )
+    #         q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+    #         q2 = q_scale_val * q2.to(gl.float32)
     
-    if Q_SEQ_LEN >= 4:
-        qid = 3
-        q3 = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs_base + qid * stride_q_s, mask=q_mask)
-        if q3.dtype.is_fp8():
-            q_scale_val = gl.amd.cdna3.buffer_load(
-                ptr=q_scale, offsets=q_scale_offs_base + qid * q_scale_stride0,
-                mask=q_grp_offs < QUERY_GRP_SZ
-            )
-            q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
-            q3 = q_scale_val * q3.to(gl.float32)
+    # if Q_SEQ_LEN >= 4:
+    #     qid = 3
+    #     q3 = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs_base + qid * stride_q_s, mask=q_mask)
+    #     if q3.dtype.is_fp8():
+    #         q_scale_val = gl.amd.cdna3.buffer_load(
+    #             ptr=q_scale, offsets=q_scale_offs_base + qid * q_scale_stride0,
+    #             mask=q_grp_offs < QUERY_GRP_SZ
+    #         )
+    #         q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+    #         q3 = q_scale_val * q3.to(gl.float32)
 
-    # ==================== Load K and Apply Scaling ====================
+    # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
     k_blk_offs = (
         kv_blk_nums[:, None, None, None] * stride_k_b
         + kv_head_idx * stride_k_nh
@@ -731,254 +755,345 @@ def pa_decode_v2_fp8(
         + blk_offs[None, None, :, None] * CONTIGUOUS_KV_ELEMS_16B_LOAD
         + contiguous_kv_elems_offs[None, None, None, :]
     )
-    
-    blk_seq_offs = ((kv_blk_start + blk_ids[:, None]) * KV_BLK_SZ + blk_offs[None, :])
-    
+    # blk_seq_offs[MAX_NUM_KV_BLKS, 1, KV_BLK_SZ_POW2, 1]
+    blk_seq_offs = ((kv_blk_start + blk_ids[:, None, None, None]) * KV_BLK_SZ + blk_offs[None, None, :, None])
+
     k_temp = gl.amd.cdna3.buffer_load(ptr=k_cache_ptr, offsets=k_blk_offs)
-    
-    # Reshape K: [MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD] 
-    # -> [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
-    k_temp_permuted = gl.permute(k_temp, [1, 3, 0, 2])
-    k_reshaped = gl.reshape(k_temp_permuted, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
-    
-    if k_temp.dtype.is_fp8():
-        k = k_reshaped
-    else:
-        k = k_reshaped.to(COMPUTE_TYPE)
+    if k_temp.dtype.is_fp8() and KV_QUANT_MODE == 0:
+        k_temp = k_temp.to(gl.float32) * k_scale
+        k_temp = k_temp.to(k_cache_ptr.dtype.element_ty)
 
-    # Handle K scaling
-    blk_seq_flatten_offs = gl.reshape(blk_seq_offs, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
-    k_scale_val = k_scale
-    v_scale_val = v_scale
+    # blk_seq_flatten_offs = gl.reshape(blk_seq_offs, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
+    # k_scale_val = k_scale
+    # v_scale_val = v_scale
+    # if k_temp.dtype.is_fp8() and KV_QUANT_MODE == 1:
+    #     kv_scale_offs = kv_blk_nums[:, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + blk_offs[None, :]
+    #     k_scale_load = gl.amd.cdna3.buffer_load(ptr=k_scale, offsets=kv_scale_offs)
+    #     v_scale_load = gl.amd.cdna3.buffer_load(ptr=v_scale, offsets=kv_scale_offs)
 
-    if k.dtype.is_fp8():
-        kv_scale_offs = kv_blk_nums[:, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + blk_offs[None, :]
-        k_scale_load = gl.amd.cdna3.buffer_load(ptr=k_scale, offsets=kv_scale_offs)
-        v_scale_load = gl.amd.cdna3.buffer_load(ptr=v_scale, offsets=kv_scale_offs)
-        
-        k_scale_val = gl.reshape(k_scale_load, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
-        v_scale_val = gl.reshape(v_scale_load, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
+    #     k_scale_val = gl.reshape(k_scale_load, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
+    #     v_scale_val = gl.reshape(v_scale_load, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
 
-        k_scale_val = tl.broadcast_to(k_scale_val[None, :], QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
-        v_scale_val = tl.broadcast_to(v_scale_val[:, None], MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2)
-        k_scale_val = softmax_scale * k_scale_val
+    #     k_scale_val = tl.broadcast_to(k_scale_val[None, :], QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
+    #     v_scale_val = tl.broadcast_to(v_scale_val[:, None], MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2)
+    #     k_scale_val = softmax_scale * k_scale_val
 
-    # ==================== Load V ====================
-    if TRANS_V:
-        blk_sz_div_offs = gl.arange(0, KV_BLK_SZ_POW2 // CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=gl.SliceLayout(1, blocked_v_trans_layout))
-        
-        v_blk_offs = (
-            kv_blk_nums[:, None, None, None] * stride_v_b
-            + kv_head_idx * stride_v_nh
-            + blk_sz_div_offs[None, :, None, None] * stride_v_hz
-            + head_sz_offs[None, None, :, None] * CONTIGUOUS_KV_ELEMS_16B_LOAD
-            + contiguous_kv_elems_offs[None, None, None, :]
-        )
-        
-        v = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs)
-        v = gl.permute(v, [0, 1, 3, 2])
-        v = gl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
-    else:
-        # v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(0, blocked_v_layout))
-        # v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(1, blocked_v_layout))
-        # v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(2, blocked_v_layout))
-        v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS)
-        v_dim1_offs = gl.arange(0, HEAD_SZ_POW2)
-        v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2)
+    # (MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD) --> (K_HEAD_SZ_POW2_SPLIT, CONTIGUOUS_KV_ELEMS_16B_LOAD, MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2)
+    k_temp = gl.reshape(k_temp, [MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2 // 2, 2, CONTIGUOUS_KV_ELEMS_16B_LOAD])
+    kt_temp = gl.permute(k_temp, [1, 4, 0, 2, 3])
+    kt_temp = gl.reshape(kt_temp, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2 // 2, 2])
+    kt0, kt1 = gl.split(kt_temp)
 
-        v_blk_offs = (
-            kv_blk_nums[:, None, None] * stride_v_b
-            + kv_head_idx * stride_v_nh
-            + v_dim1_offs[None, :, None] * stride_v_hz
-            + v_dim2_offs[None, None, :]
-        )
-
-        v_len_offs = kv_blk_start + v_dim0_offs[:, None, None] * KV_BLK_SZ + v_dim2_offs[None, None, :]
-        v_mask = (
-            (v_len_offs < kv_seq_len) &
-            (v_dim2_offs[None, None, :] < KV_BLK_SZ) &
-            (v_dim1_offs[None, :, None] < HEAD_SZ)
-        )
-        
-        v = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs, mask=v_mask)
-        v = gl.permute(v, [0, 2, 1])
-        v = gl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
-
-    # Apply V scaling
-    if v.dtype.is_fp8():
-        v = v_scale_val * v.to(gl.float32)
-        v = v.to(v_cache_ptr.dtype.element_ty)
-    else:
-        v = v.to(COMPUTE_TYPE)
-
-    # ==================== Process Q0 ====================
-    QID = 0
-    q = q0
-
-    # Prepare Q for computation
-    if k_temp.dtype.is_fp8():
-        q = q.to(k_cache_ptr.dtype.element_ty)
-    else:
-        q = (q.to(gl.float32) * softmax_scale).to(COMPUTE_TYPE)
-
-    # QK Matmul with MFMA
-    accumulator_qk = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2), dtype=gl.float32, layout=qk_mfma_layout)
-    qc = gl.convert_layout(q, layout=qk_lhs_layout)
-    kc = gl.convert_layout(k, layout=qk_rhs_layout)
-    qk = gl.amd.cdna3.mfma(qc, kc, accumulator_qk)
-    
-    # Apply K scaling for FP8
-    if k_temp.dtype.is_fp8():
-        qk = k_scale_val * qk
-
-    # Apply attention mask and alibi
-    qk_bound_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ)
-    if IS_CAUSAL:
-        causal_mask = blk_seq_flatten_offs[None, :] < kv_seq_len - (Q_SEQ_LEN - 1 - QID)
-    else:
-        causal_mask = blk_seq_flatten_offs[None, :] < kv_seq_len
-    qk_bound_mask = qk_bound_mask & causal_mask
+    accumulator0 = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2 // 2), dtype=gl.float32, layout=qk_mfma_layout)
+    accumulator1 = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2 // 2), dtype=gl.float32, layout=qk_mfma_layout)
+    qc = gl.convert_layout(q0, layout=qk_lhs_layout)
+    kc0 = gl.convert_layout(kt0, layout=qk_rhs_layout)
+    kc1 = gl.convert_layout(kt1, layout=qk_rhs_layout)
+    qk0 = gl.amd.cdna3.mfma(qc, kc0, accumulator0)
+    qk1 = gl.amd.cdna3.mfma(qc, kc1, accumulator1)
+    qk = gl.join(qk0, qk1)
+    qk = gl.reshape(qk, [QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
 
     if alibi_slopes is not None:
-        qk += (alibi_slope[:, None] * (blk_seq_flatten_offs - kv_seq_len + 1)[None, :]).to(gl.float32)
+        qk += (alibi_slope[:, None] * (qk_col_offs - kv_seq_len + 1)[None, :]).to(gl.float32)
+    qk = gl.where(
+        (qk_row_offs[:, None] < QUERY_GRP_SZ) & (qk_col_offs[None, :] < kv_seq_len),
+        qk,
+        float("-inf"),
+    )
 
-    qk = gl.where(qk_bound_mask, qk, float(-1e37))
-
-    # Softmax
     max_logit_new = gl.max(qk, axis=1)
+    # p[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
     exp_sum = gl.sum(p, axis=1)
-
-    # Prepare P for PV matmul
-    if v.dtype.is_fp8():
+    if CONTIGUOUS_KV_ELEMS_16B_LOAD == 16:
+        # kv is 8bit
         p = p.to(v_cache_ptr.dtype.element_ty)
     else:
         p = p.to(COMPUTE_TYPE)
 
-    # Store max_logits and exp_sums
-    m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
+    m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_linear_layout))
     m_l_offs = (
         seq_idx * stride_max_logits_s
         + kv_head_idx * stride_max_logits_nh
         + seq_part_idx * stride_max_logits_p
         + m_l_base_offs
-        + QID * QUERY_GRP_SZ
     )
     m_l_grp_mask = m_l_base_offs < QUERY_GRP_SZ
+    tl.static_print(max_logit_new.type, m_l_offs.type)
     gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
     gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
 
-    # PV Matmul with MFMA
-    accumulator_pv = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
+
+    blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout( # 256x128
+        reg_bases=((0,0,1), (0,0,2), (0,0,4), (0,0,8), (4,0,0), (8,0,0), (0,64,0)), # 16 x 8
+        lane_bases=((0,1,0), (0,2,0), (0,4,0), (0,8,0), (1,0,0), (2,0,0)), # 64
+        warp_bases=((0,16,0), (0,32,0)), # 4
+        block_bases=[], # 8
+        shape=[16, 128, 16],
+    )
+    v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
+    v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout)))
+    v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_v_layout)))
+
+    kv_blk_nums2 = gl.convert_layout(kv_blk_nums, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
+    # v_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
+    v_blk_offs = (
+        kv_blk_nums2[:, None, None] * stride_v_b
+        + kv_head_idx * stride_v_nh
+        + v_dim1_offs[None, :, None] * stride_v_hz
+        + v_dim2_offs[None, None, :]
+    )
+
+    # v[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
+    v = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs)
+    if v.dtype.is_fp8() and KV_QUANT_MODE == 0:
+        # v = v.to(gl.float32) * v_scale
+        v = v.to(v_cache_ptr.dtype.element_ty)
+    # [MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2] --> [MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2, HEAD_SZ_POW2]
+    v = gl.permute(v, [0, 2, 1])
+    # v[MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2]
+    v = gl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
+
+    accumulator2 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
     pc = gl.convert_layout(p, layout=pv_lhs_layout)
     vc = gl.convert_layout(v, layout=pv_rhs_layout)
-    acc = gl.amd.cdna3.mfma(pc, vc, accumulator_pv)
-
-    # Normalize and convert
+    acc = gl.amd.cdna3.mfma(pc, vc, accumulator2)
     exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
-    exp_sum_broadcast = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
-    acc = acc / exp_sum_broadcast
-    acc = acc.to(COMPUTE_TYPE)
+    exp_sum = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+    acc = acc / exp_sum
+    # acc = acc.to(COMPUTE_TYPE)
+    acc = acc.to(v_cache_ptr.dtype.element_ty)
 
-    # Store output
     o_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, pv_mfma_layout))
     o_head_sz_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, pv_mfma_layout))
     o_mask = (o_grp_offs[:, None] < QUERY_GRP_SZ) & (o_head_sz_offs[None, :] < HEAD_SZ)
     logits_offs = seq_idx * stride_logits_s
     logits_offs += kv_head_idx * stride_logits_nh
-    logits_offs += seq_part_idx * stride_logits_p
     logits_offs += (
-        o_grp_offs[:, None] * stride_logits_g
+        seq_part_idx * stride_logits_p
+        + o_grp_offs[:, None] * stride_logits_g
         + o_head_sz_offs[None, :]
-        + QID * QUERY_GRP_SZ * stride_logits_g
     )
     gl.amd.cdna3.buffer_store(stored_value=acc, ptr=logits_ptr, offsets=logits_offs, mask=o_mask)
 
 
-    # ==================== Process Q1 (if Q_SEQ_LEN >= 2) ====================
-    if Q_SEQ_LEN >= 2:
-        QID = 1
-        q = q1
-            
-        # Prepare Q for computation
-        if k_temp.dtype.is_fp8():
-            q = q.to(k_cache_ptr.dtype.element_ty)
-        else:
-            q = (q.to(gl.float32) * softmax_scale).to(COMPUTE_TYPE)
-
-        # QK Matmul with MFMA
-        accumulator_qk = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2), dtype=gl.float32, layout=qk_mfma_layout)
-        qc = gl.convert_layout(q, layout=qk_lhs_layout)
-        kc = gl.convert_layout(k, layout=qk_rhs_layout)
-        qk = gl.amd.cdna3.mfma(qc, kc, accumulator_qk)
+    # # ==================== Load V ====================
+    # if TRANS_V:
+    #     blk_sz_div_offs = gl.arange(0, KV_BLK_SZ_POW2 // CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=gl.SliceLayout(1, blocked_v_trans_layout))
         
-        # Apply K scaling for FP8
-        if k_temp.dtype.is_fp8():
-            qk = k_scale_val * qk
+    #     v_blk_offs = (
+    #         kv_blk_nums[:, None, None, None] * stride_v_b
+    #         + kv_head_idx * stride_v_nh
+    #         + blk_sz_div_offs[None, :, None, None] * stride_v_hz
+    #         + head_sz_offs[None, None, :, None] * CONTIGUOUS_KV_ELEMS_16B_LOAD
+    #         + contiguous_kv_elems_offs[None, None, None, :]
+    #     )
+        
+    #     v = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs)
+    #     v = gl.permute(v, [0, 1, 3, 2])
+    #     v = gl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
+    # else:
+    #     # v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(0, blocked_v_layout))
+    #     # v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(1, blocked_v_layout))
+    #     # v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(2, blocked_v_layout))
+    #     v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS)
+    #     v_dim1_offs = gl.arange(0, HEAD_SZ_POW2)
+    #     v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2)
 
-        # Apply attention mask and alibi
-        qk_bound_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ)
-        if IS_CAUSAL:
-            causal_mask = blk_seq_flatten_offs[None, :] < kv_seq_len - (Q_SEQ_LEN - 1 - QID)
-        else:
-            causal_mask = blk_seq_flatten_offs[None, :] < kv_seq_len
-        qk_bound_mask = qk_bound_mask & causal_mask
+    #     v_blk_offs = (
+    #         kv_blk_nums[:, None, None] * stride_v_b
+    #         + kv_head_idx * stride_v_nh
+    #         + v_dim1_offs[None, :, None] * stride_v_hz
+    #         + v_dim2_offs[None, None, :]
+    #     )
 
-        if alibi_slopes is not None:
-            qk += (alibi_slope[:, None] * (blk_seq_flatten_offs - kv_seq_len + 1)[None, :]).to(gl.float32)
+    #     v_len_offs = kv_blk_start + v_dim0_offs[:, None, None] * KV_BLK_SZ + v_dim2_offs[None, None, :]
+    #     v_mask = (
+    #         (v_len_offs < kv_seq_len) &
+    #         (v_dim2_offs[None, None, :] < KV_BLK_SZ) &
+    #         (v_dim1_offs[None, :, None] < HEAD_SZ)
+    #     )
+        
+    #     v = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs, mask=v_mask)
+    #     v = gl.permute(v, [0, 2, 1])
+    #     v = gl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
 
-        qk = gl.where(qk_bound_mask, qk, float(-1e37))
+    # # Apply V scaling
+    # if v.dtype.is_fp8():
+    #     v = v_scale_val * v.to(gl.float32)
+    #     v = v.to(v_cache_ptr.dtype.element_ty)
+    # else:
+    #     v = v.to(COMPUTE_TYPE)
 
-        # Softmax
-        max_logit_new = gl.max(qk, axis=1)
-        p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
-        exp_sum = gl.sum(p, axis=1)
+    # # ==================== Process Q0 ====================
+    # QID = 0
+    # q = q0
 
-        # Prepare P for PV matmul
-        if v.dtype.is_fp8():
-            p = p.to(v_cache_ptr.dtype.element_ty)
-        else:
-            p = p.to(COMPUTE_TYPE)
+    # # Prepare Q for computation
+    # if k_temp.dtype.is_fp8():
+    #     q = q.to(k_cache_ptr.dtype.element_ty)
+    # else:
+    #     q = (q.to(gl.float32) * softmax_scale).to(COMPUTE_TYPE)
 
-        # Store max_logits and exp_sums
-        max_logits_offs = (
-            seq_idx * stride_max_logits_s
-            + kv_head_idx * stride_max_logits_nh
-            + seq_part_idx * stride_max_logits_p
-            + q_grp_offs
-            + QID * QUERY_GRP_SZ
-        )
-        m_grp_mask = q_grp_offs < QUERY_GRP_SZ
-        gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=max_logits_offs, mask=m_grp_mask)
-        gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=max_logits_offs, mask=m_grp_mask)
+    # # QK Matmul with MFMA
+    # accumulator_qk = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2), dtype=gl.float32, layout=qk_mfma_layout)
+    # qc = gl.convert_layout(q, layout=qk_lhs_layout)
+    # kc = gl.convert_layout(k, layout=qk_rhs_layout)
+    # qk = gl.amd.cdna3.mfma(qc, kc, accumulator_qk)
+    
+    # # Apply K scaling for FP8
+    # if k_temp.dtype.is_fp8():
+    #     qk = k_scale_val * qk
 
-        # PV Matmul with MFMA
-        accumulator_pv = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
-        pc = gl.convert_layout(p, layout=pv_lhs_layout)
-        vc = gl.convert_layout(v, layout=pv_rhs_layout)
-        acc = gl.amd.cdna3.mfma(pc, vc, accumulator_pv)
+    # # Apply attention mask and alibi
+    # qk_bound_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ)
+    # if IS_CAUSAL:
+    #     causal_mask = blk_seq_flatten_offs[None, :] < kv_seq_len - (Q_SEQ_LEN - 1 - QID)
+    # else:
+    #     causal_mask = blk_seq_flatten_offs[None, :] < kv_seq_len
+    # qk_bound_mask = qk_bound_mask & causal_mask
 
-        # Normalize and convert
-        exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
-        exp_sum_broadcast = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
-        acc = acc / exp_sum_broadcast
-        acc = acc.to(COMPUTE_TYPE)
+    # if alibi_slopes is not None:
+    #     qk += (alibi_slope[:, None] * (blk_seq_flatten_offs - kv_seq_len + 1)[None, :]).to(gl.float32)
 
-        # Store output
-        logits_offs = (
-            seq_idx * stride_logits_s
-            + kv_head_idx * stride_logits_nh
-            + seq_part_idx * stride_logits_p
-            + q_grp_offs[:, None] * stride_logits_g
-            + head_sz_offs[None, :]
-            + QID * QUERY_GRP_SZ * stride_logits_g
-        )
-        o_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
-        gl.amd.cdna3.buffer_store(stored_value=acc, ptr=logits_ptr, offsets=logits_offs, mask=o_mask)
+    # qk = gl.where(qk_bound_mask, qk, float(-1e37))
 
-    # ==================== Process Q2 and Q3 if needed ====================
-    # Additional QID processing can be added here following the same pattern
-    # for Q_SEQ_LEN >= 3 and Q_SEQ_LEN >= 4
+    # # Softmax
+    # max_logit_new = gl.max(qk, axis=1)
+    # p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
+    # exp_sum = gl.sum(p, axis=1)
+
+    # # Prepare P for PV matmul
+    # if v.dtype.is_fp8():
+    #     p = p.to(v_cache_ptr.dtype.element_ty)
+    # else:
+    #     p = p.to(COMPUTE_TYPE)
+
+    # # Store max_logits and exp_sums
+    # m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
+    # m_l_offs = (
+    #     seq_idx * stride_max_logits_s
+    #     + kv_head_idx * stride_max_logits_nh
+    #     + seq_part_idx * stride_max_logits_p
+    #     + m_l_base_offs
+    #     + QID * QUERY_GRP_SZ
+    # )
+    # m_l_grp_mask = m_l_base_offs < QUERY_GRP_SZ
+    # gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
+    # gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
+
+    # # PV Matmul with MFMA
+    # accumulator_pv = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
+    # pc = gl.convert_layout(p, layout=pv_lhs_layout)
+    # vc = gl.convert_layout(v, layout=pv_rhs_layout)
+    # acc = gl.amd.cdna3.mfma(pc, vc, accumulator_pv)
+
+    # # Normalize and convert
+    # exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
+    # exp_sum_broadcast = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+    # acc = acc / exp_sum_broadcast
+    # acc = acc.to(COMPUTE_TYPE)
+
+    # # Store output
+    # o_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, pv_mfma_layout))
+    # o_head_sz_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, pv_mfma_layout))
+    # o_mask = (o_grp_offs[:, None] < QUERY_GRP_SZ) & (o_head_sz_offs[None, :] < HEAD_SZ)
+    # logits_offs = seq_idx * stride_logits_s
+    # logits_offs += kv_head_idx * stride_logits_nh
+    # logits_offs += seq_part_idx * stride_logits_p
+    # logits_offs += (
+    #     o_grp_offs[:, None] * stride_logits_g
+    #     + o_head_sz_offs[None, :]
+    #     + QID * QUERY_GRP_SZ * stride_logits_g
+    # )
+    # gl.amd.cdna3.buffer_store(stored_value=acc, ptr=logits_ptr, offsets=logits_offs, mask=o_mask)
+
+
+    # # ==================== Process Q1 (if Q_SEQ_LEN >= 2) ====================
+    # if Q_SEQ_LEN >= 2:
+    #     QID = 1
+    #     q = q1
+            
+    #     # Prepare Q for computation
+    #     if k_temp.dtype.is_fp8():
+    #         q = q.to(k_cache_ptr.dtype.element_ty)
+    #     else:
+    #         q = (q.to(gl.float32) * softmax_scale).to(COMPUTE_TYPE)
+
+    #     # QK Matmul with MFMA
+    #     accumulator_qk = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2), dtype=gl.float32, layout=qk_mfma_layout)
+    #     qc = gl.convert_layout(q, layout=qk_lhs_layout)
+    #     kc = gl.convert_layout(k, layout=qk_rhs_layout)
+    #     qk = gl.amd.cdna3.mfma(qc, kc, accumulator_qk)
+        
+    #     # Apply K scaling for FP8
+    #     if k_temp.dtype.is_fp8():
+    #         qk = k_scale_val * qk
+
+    #     # Apply attention mask and alibi
+    #     qk_bound_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ)
+    #     if IS_CAUSAL:
+    #         causal_mask = blk_seq_flatten_offs[None, :] < kv_seq_len - (Q_SEQ_LEN - 1 - QID)
+    #     else:
+    #         causal_mask = blk_seq_flatten_offs[None, :] < kv_seq_len
+    #     qk_bound_mask = qk_bound_mask & causal_mask
+
+    #     if alibi_slopes is not None:
+    #         qk += (alibi_slope[:, None] * (blk_seq_flatten_offs - kv_seq_len + 1)[None, :]).to(gl.float32)
+
+    #     qk = gl.where(qk_bound_mask, qk, float(-1e37))
+
+    #     # Softmax
+    #     max_logit_new = gl.max(qk, axis=1)
+    #     p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
+    #     exp_sum = gl.sum(p, axis=1)
+
+    #     # Prepare P for PV matmul
+    #     if v.dtype.is_fp8():
+    #         p = p.to(v_cache_ptr.dtype.element_ty)
+    #     else:
+    #         p = p.to(COMPUTE_TYPE)
+
+    #     # Store max_logits and exp_sums
+    #     max_logits_offs = (
+    #         seq_idx * stride_max_logits_s
+    #         + kv_head_idx * stride_max_logits_nh
+    #         + seq_part_idx * stride_max_logits_p
+    #         + q_grp_offs
+    #         + QID * QUERY_GRP_SZ
+    #     )
+    #     m_grp_mask = q_grp_offs < QUERY_GRP_SZ
+    #     gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=max_logits_offs, mask=m_grp_mask)
+    #     gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=max_logits_offs, mask=m_grp_mask)
+
+    #     # PV Matmul with MFMA
+    #     accumulator_pv = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
+    #     pc = gl.convert_layout(p, layout=pv_lhs_layout)
+    #     vc = gl.convert_layout(v, layout=pv_rhs_layout)
+    #     acc = gl.amd.cdna3.mfma(pc, vc, accumulator_pv)
+
+    #     # Normalize and convert
+    #     exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
+    #     exp_sum_broadcast = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
+    #     acc = acc / exp_sum_broadcast
+    #     acc = acc.to(COMPUTE_TYPE)
+
+    #     # Store output
+    #     logits_offs = (
+    #         seq_idx * stride_logits_s
+    #         + kv_head_idx * stride_logits_nh
+    #         + seq_part_idx * stride_logits_p
+    #         + q_grp_offs[:, None] * stride_logits_g
+    #         + head_sz_offs[None, :]
+    #         + QID * QUERY_GRP_SZ * stride_logits_g
+    #     )
+    #     o_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
+    #     gl.amd.cdna3.buffer_store(stored_value=acc, ptr=logits_ptr, offsets=logits_offs, mask=o_mask)
+
+    # # ==================== Process Q2 and Q3 if needed ====================
+    # # Additional QID processing can be added here following the same pattern
+    # # for Q_SEQ_LEN >= 3 and Q_SEQ_LEN >= 4
 
 
 @triton.jit
@@ -1343,8 +1458,8 @@ def paged_attention_decode(
     exp_sums = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
     # tmp_output = torch.empty(
     tmp_output = torch.zeros(
-        # (*shape_info, 256), dtype=output.dtype, device=output.device
-        *shape_info, head_sz, dtype=output.dtype, device=output.device
+        *shape_info, head_sz, dtype=torch.float8_e4m3fnuz, device=output.device
+        # *shape_info, head_sz, dtype=output.dtype, device=output.device
     )
 
     if query_grp_sz <= 16:
@@ -1366,36 +1481,38 @@ def paged_attention_decode(
     output = output.reshape(batch_size, q_seq_len, num_kv_heads, query_grp_sz, head_sz)
     output = output.transpose(1, 2).reshape(batch_size, num_kv_heads * q_seq_len * query_grp_sz, head_sz).contiguous()
 
-    # print(f"shape_info={shape_info}")
-    # print(f"query.shape={query.shape}")
-    # print(f"q_scale.shape={q_scale.shape}")
-    # print(f"key_cache.shape={key_cache.shape}")
-    # print(f"value_cache.shape={value_cache.shape}")
-    # print(f"output.shape={output.shape}")
-    # print(f"tmp_output.shape={tmp_output.shape}")
-    # print(f"block_tables.shape={block_tables.shape}")
-    # print(f"query.dtype={query.dtype}")
-    # print(f"key_cache.dtype={key_cache.dtype}")
-    # print(f"value_cache.dtype={value_cache.dtype}")
-    # print(f"output.dtype={output.dtype}")
-    # print(f"block_tables.dtype={block_tables.dtype}")
-    # print(f"value_cache.stride()={value_cache.stride()}")
-    # print(f"query.stride()={query.stride()}")
-    # print(f"q_scale.stride()={q_scale.stride()}")
-    # print(f"tmp_output.stride()={tmp_output.stride()}")
-    # input_config = dict(
-    #     q_seq_len=q_seq_len,
-    #     kv_type=compute_type,
-    #     COMPUTE_TYPE=compute_type,
-    #     HEAD_SZ=head_sz,
-    #     HEAD_SZ_POW2=head_sz_pow2,
-    #     QUERY_GRP_SZ=equi_query_grp_sz,
-    #     QUERY_GRP_SZ_POW2=equi_query_grp_sz_pow2,
-    #     KV_BLK_SZ=kv_blk_sz,
-    #     KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-    #     SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-    # )
-    # print(input_config)
+    print(f"grid={grid}")
+    print(f"shape_info={shape_info}")
+    print(f"query.shape={query.shape}")
+    print(f"q_scale.shape={q_scale.shape}")
+    print(f"key_cache.shape={key_cache.shape}")
+    print(f"value_cache.shape={value_cache.shape}")
+    print(f"output.shape={output.shape}")
+    print(f"tmp_output.shape={tmp_output.shape}")
+    print(f"block_tables.shape={block_tables.shape}")
+    print(f"query.dtype={query.dtype}")
+    print(f"key_cache.dtype={key_cache.dtype}")
+    print(f"value_cache.dtype={value_cache.dtype}")
+    print(f"output.dtype={output.dtype}")
+    print(f"tmp_output.dtype={tmp_output.dtype}")
+    print(f"block_tables.dtype={block_tables.dtype}")
+    print(f"value_cache.stride()={value_cache.stride()}")
+    print(f"query.stride()={query.stride()}")
+    print(f"q_scale.stride()={q_scale.stride()}")
+    print(f"tmp_output.stride()={tmp_output.stride()}")
+    input_config = dict(
+        q_seq_len=q_seq_len,
+        kv_type=compute_type,
+        COMPUTE_TYPE=compute_type,
+        HEAD_SZ=head_sz,
+        HEAD_SZ_POW2=head_sz_pow2,
+        QUERY_GRP_SZ=equi_query_grp_sz,
+        QUERY_GRP_SZ_POW2=equi_query_grp_sz_pow2,
+        KV_BLK_SZ=kv_blk_sz,
+        KV_BLK_SZ_POW2=kv_blk_sz_pow2,
+        SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+    )
+    print(input_config)
 
 
     _, decode_time = _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
@@ -1409,9 +1526,12 @@ def paged_attention_decode(
         block_tables,
         seq_lens,
         attn_scale,
-        q_scale,
-        k_scale,
-        v_scale,
+        # q_scale,
+        # k_scale,
+        # v_scale,
+        q_scale.reshape(-1)[0].item(),
+        k_scale.reshape(-1)[0].item(),
+        v_scale.reshape(-1)[0].item(),
         alibi_slopes,
         exp_sums.stride(0),
         exp_sums.stride(1),

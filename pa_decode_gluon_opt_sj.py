@@ -1305,6 +1305,7 @@ def paged_attn_decode_v2(
         print(f"key_cache.dtype={key_cache.dtype}")
         print(f"value_cache.dtype={value_cache.dtype}")
         print(f"output.dtype={output.dtype}")
+        print(f"tmp_output.dtype={tmp_output.dtype}")
         print(f"block_tables.dtype={block_tables.dtype}")
         input_config = dict(
             scale=scale,

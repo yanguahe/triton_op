@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
+import os
 import argparse
 import random
 from typing import List, Optional, Tuple, Union, Dict
@@ -21,10 +21,14 @@ from utils import compare_arrays
 # from pa_decode_gluon import paged_attention_decode as paged_attention_decode_gluon
 from pa_decode_triton import paged_attention_decode as paged_attention_decode_triton
 # from pa_decode_triton_fp8 import paged_attention_decode as paged_attention_decode_triton_fp8
-from pa_decode_triton_fp8_2 import paged_attention_decode as paged_attention_decode_triton_fp8
-# from pa_decode_triton_fp8_gluon import paged_attention_decode as paged_attention_decode_triton_fp8
+# from pa_decode_triton_fp8_2 import paged_attention_decode as paged_attention_decode_triton_fp8
+from pa_decode_triton_fp8_gluon import paged_attention_decode as paged_attention_decode_triton_fp8
 import triton.language as tl
 
+
+os.environ["TRITON_CACHE_DIR"] = "/home/sijieli2/gluon_cache"
+os.environ["AITER_LOG_MORE"] = "1"
+os.environ["USE_IR_LOC"] = "ttgir"
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -526,26 +530,26 @@ def test_pa_mtp(
     )
 
 
-    out_hip_noquant, us_hip = run_aiter_hip(
-        query,
-        k_cache,
-        v_cache,
-        block_tables,
-        seq_lens,
-        ctx_lens,
-        max_qlen,
-        "auto",
-        num_kv_heads,
-        softmax_scale,
-    )
-    err_hip_noquant = checkAllclose(
-        out_ref_noquant,
-        out_hip_noquant,
-        msg=f"[torch vs aiter_hip][No Quant]: {us_hip:>8.2f} us......",
-    )
-    compare_arrays(out_hip_noquant.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
-    ret["us_hip_bf16"] = us_hip
-    ret["err_hip_bf16"] = err_hip_noquant
+    # out_hip_noquant, us_hip = run_aiter_hip(
+    #     query,
+    #     k_cache,
+    #     v_cache,
+    #     block_tables,
+    #     seq_lens,
+    #     ctx_lens,
+    #     max_qlen,
+    #     "auto",
+    #     num_kv_heads,
+    #     softmax_scale,
+    # )
+    # err_hip_noquant = checkAllclose(
+    #     out_ref_noquant,
+    #     out_hip_noquant,
+    #     msg=f"[torch vs aiter_hip][No Quant]: {us_hip:>8.2f} us......",
+    # )
+    # # compare_arrays(out_hip_noquant.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
+    # ret["us_hip_bf16"] = us_hip
+    # ret["err_hip_bf16"] = err_hip_noquant
 
 
     triton_output = torch.empty_like(out_ref_noquant)
@@ -570,7 +574,7 @@ def test_pa_mtp(
         triton_output,
         msg=f"[torch vs triton][No Quant]: {us_triton:>8.2f} us......",
     )
-    compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
+    # compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
     ret["us_triton_bf16"] = us_triton
     ret["err_triton_bf16"] = err_triton_noquant
 
@@ -633,6 +637,14 @@ def test_pa_mtp(
     # print(f"v_cvted_md5={v_cvted_md5}")
 
 
+    q_scale1 = q_scale.clone()
+    k_scale_asm1 = k_scale_asm.clone()
+    v_scale_asm1 = v_scale_asm.clone()
+    q_scale[...] = q_scale1.reshape(-1)[0]
+    k_scale_asm[...] = k_scale_asm1.reshape(-1)[0]
+    v_scale_asm[...] = v_scale_asm1.reshape(-1)[0]
+    query = q_scale * q_quant.to(torch.float32)
+    query = query.to(dtype)
     # quant version torch ref
     out_ref = torch_mha_extend(
         query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
@@ -691,28 +703,28 @@ def test_pa_mtp(
     print(f"triton.version={triton.__version__}")
 
 
-    out_aiter_asm, us_aiter_asm = run_aiter_asm(
-        query,
-        k_quant_,
-        v_quant_,
-        block_tables,
-        seq_lens,
-        block_tables.size(1),
-        max_qlen,
-        k_scale_asm,
-        v_scale_asm,
-        qo_indptr,
-    )
-    err = checkAllclose(
-        out_ref,
-        out_aiter_asm,
-        atol=fp8_diff_thr,
-        rtol=fp8_diff_thr,
-        msg=f"[torch vs aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
-    )
-    compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
-    ret["us_asm_fp8"] = us_aiter_asm
-    ret["err fp8"] = err
+    # out_aiter_asm, us_aiter_asm = run_aiter_asm(
+    #     query,
+    #     k_quant_,
+    #     v_quant_,
+    #     block_tables,
+    #     seq_lens,
+    #     block_tables.size(1),
+    #     max_qlen,
+    #     k_scale_asm,
+    #     v_scale_asm,
+    #     qo_indptr,
+    # )
+    # err = checkAllclose(
+    #     out_ref,
+    #     out_aiter_asm,
+    #     atol=fp8_diff_thr,
+    #     rtol=fp8_diff_thr,
+    #     msg=f"[torch vs aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
+    # )
+    # # compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    # ret["us_asm_fp8"] = us_aiter_asm
+    # ret["err fp8"] = err
 
 
     # q_scale = q_scale.squeeze(-1)

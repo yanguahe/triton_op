@@ -377,8 +377,8 @@ NUM_SEQS_LIST = [32]
 SEQ_LEN_LIST = [4096]
 NUM_HEADS_LIST = [(8, 1)]
 # NUM_HEADS_LIST = [(16, 1)]
-DTYPE_LIST = [torch.bfloat16]
-# DTYPE_LIST = [torch.float8_e4m3fnuz]
+# DTYPE_LIST = [torch.bfloat16]
+DTYPE_LIST = [torch.bfloat16, torch.float8_e4m3fnuz]
 
 for (num_seq, seq_len, num_heads, dtype) in itertools.product(
     NUM_SEQS_LIST, SEQ_LEN_LIST, NUM_HEADS_LIST, DTYPE_LIST):
