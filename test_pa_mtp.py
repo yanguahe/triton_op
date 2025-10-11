@@ -21,8 +21,8 @@ from utils import compare_arrays
 # from pa_decode_gluon import paged_attention_decode as paged_attention_decode_gluon
 from pa_decode_triton import paged_attention_decode as paged_attention_decode_triton
 # from pa_decode_triton_fp8 import paged_attention_decode as paged_attention_decode_triton_fp8
-# from pa_decode_triton_fp8_2 import paged_attention_decode as paged_attention_decode_triton_fp8
-from pa_decode_triton_fp8_gluon import paged_attention_decode as paged_attention_decode_triton_fp8
+from pa_decode_triton_fp8_2 import paged_attention_decode as paged_attention_decode_triton_fp8
+from pa_decode_triton_fp8_gluon import paged_attention_decode as paged_attention_decode_gluon_fp8
 import triton.language as tl
 
 
@@ -411,7 +411,7 @@ def run_triton_fp8(
     return output, result
 
 
-def run_gluon(
+def run_gluon_fp8(
     output: torch.Tensor,       # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
     query: torch.Tensor,        # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
     key_cache: torch.Tensor,    # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
@@ -421,6 +421,7 @@ def run_gluon(
     attn_scale: float,
     max_seq_len: int,
     compute_type,
+    q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     num_seq_partitions: int = 0,  # TODO use this below
@@ -429,7 +430,7 @@ def run_gluon(
     exp_sums: torch.Tensor = None,
     tmp_output: torch.Tensor = None,
 ) -> None:
-    result = paged_attention_decode_gluon(
+    result = paged_attention_decode_gluon_fp8(
         output,
         query,
         key_cache,
@@ -439,6 +440,7 @@ def run_gluon(
         attn_scale,
         max_seq_len,
         compute_type,
+        q_scale,
         k_scale,
         v_scale,
         num_seq_partitions=0,
@@ -574,10 +576,9 @@ def test_pa_mtp(
         triton_output,
         msg=f"[torch vs triton][No Quant]: {us_triton:>8.2f} us......",
     )
-    # compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
+    compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
     ret["us_triton_bf16"] = us_triton
     ret["err_triton_bf16"] = err_triton_noquant
-
     out_ref_noquant_md5 = hashlib.md5(out_ref_noquant.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
     triton_output_md5 = hashlib.md5(triton_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
     print(f"out_ref_noquant_md5={out_ref_noquant_md5}")
@@ -655,7 +656,6 @@ def test_pa_mtp(
         print(f"trans v_quant_.shape={v_quant_.shape}")
     fp8_diff_thr = 5e-2
 
-
     triton_fp8_output = torch.empty_like(out_ref_noquant)
     triton_fp8_output, us_triton = run_triton_fp8(
         triton_fp8_output,
@@ -677,11 +677,6 @@ def test_pa_mtp(
         num_seq_partitions=0,
         alibi_slopes=None,
     )
-    # import pdb
-    # pdb.set_trace()
-    # tmp_out = us_triton['tmp_output']
-    # tmp_out = tmp_out.reshape(batch_size, -1, head_size)
-
     us_triton = us_triton['triton']
     err_triton_noquant = checkAllclose(
         out_ref,
@@ -695,36 +690,73 @@ def test_pa_mtp(
     ret["us_triton_fp8"] = us_triton
     ret["err_triton_fp8"] = err_triton_noquant
 
+
+    gluon_fp8_output = torch.empty_like(out_ref_noquant)
+    gluon_fp8_output, us_triton = run_gluon_fp8(
+        gluon_fp8_output,
+        # query,
+        # k_cache,
+        # v_cache,
+        q_quant,
+        k_quant_,
+        v_quant_,
+
+        seq_lens,
+        block_tables,
+        softmax_scale,
+        seq_lens.max().item(),
+        torch_to_tl_dtype[dtype],
+        q_scale=q_scale,
+        k_scale=k_scale_asm,
+        v_scale=v_scale_asm,
+        num_seq_partitions=0,
+        alibi_slopes=None,
+    )
+    us_triton = us_triton['triton']
+    err_triton_noquant = checkAllclose(
+        out_ref,
+        gluon_fp8_output,
+        atol=fp8_diff_thr,
+        rtol=fp8_diff_thr,
+        msg=f"[torch vs gluon_fp8][   Quant]: {us_triton:>8.2f} us......",
+    )
+    compare_arrays(gluon_fp8_output.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    ret["us_gluon_fp8"] = us_triton
+    ret["err_gluon_fp8"] = err_triton_noquant
     out_ref_md5 = hashlib.md5(out_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    triton_fp8_output_md5 = hashlib.md5(triton_fp8_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    gluon_fp8_output_md5 = hashlib.md5(gluon_fp8_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
     print(f"out_ref_md5={out_ref_md5}")
-    print(f"triton_fp8_output_md5={triton_fp8_output_md5}")
-    print(f"triton={triton}")
-    print(f"triton.version={triton.__version__}")
+    print(f"gluon_fp8_output_md5={gluon_fp8_output_md5}")
+    kt_us = us_triton
+    bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant_.dtype.itemsize + 2 * 1 * num_query_heads * q_quant.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
+    ret["gluon_fp8_bandwith(TB/s)"] = bandwith
 
 
-    # out_aiter_asm, us_aiter_asm = run_aiter_asm(
-    #     query,
-    #     k_quant_,
-    #     v_quant_,
-    #     block_tables,
-    #     seq_lens,
-    #     block_tables.size(1),
-    #     max_qlen,
-    #     k_scale_asm,
-    #     v_scale_asm,
-    #     qo_indptr,
-    # )
-    # err = checkAllclose(
-    #     out_ref,
-    #     out_aiter_asm,
-    #     atol=fp8_diff_thr,
-    #     rtol=fp8_diff_thr,
-    #     msg=f"[torch vs aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
-    # )
-    # # compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
-    # ret["us_asm_fp8"] = us_aiter_asm
-    # ret["err fp8"] = err
+    out_aiter_asm, us_aiter_asm = run_aiter_asm(
+        query,
+        k_quant_,
+        v_quant_,
+        block_tables,
+        seq_lens,
+        block_tables.size(1),
+        max_qlen,
+        k_scale_asm,
+        v_scale_asm,
+        qo_indptr,
+    )
+    err = checkAllclose(
+        out_ref,
+        out_aiter_asm,
+        atol=fp8_diff_thr,
+        rtol=fp8_diff_thr,
+        msg=f"[torch vs aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
+    )
+    compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    ret["us_asm_fp8"] = us_aiter_asm
+    ret["err fp8"] = err
+    kt_us = us_aiter_asm
+    bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant_.dtype.itemsize + 2 * 1 * num_query_heads * query.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
+    ret["asm_fp8_bandwith(TB/s)"] = bandwith
 
 
     # q_scale = q_scale.squeeze(-1)
@@ -753,6 +785,10 @@ def test_pa_mtp(
     # compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
     # ret["us_hip_fp8"] = us_hip
     # ret["err_hip_fp8"] = err
+
+
+    print(f"triton={triton}")
+    print(f"triton.version={triton.__version__}")
 
     return ret
 

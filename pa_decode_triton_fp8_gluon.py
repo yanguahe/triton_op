@@ -697,9 +697,9 @@ def pa_decode_v2_fp8(
     #     q0 = (q0.to(gl.float32) * softmax_scale).to(COMPUTE_TYPE)
     # 0 for per_tensor quant
     if q0.dtype.is_fp8() and Q_QUANT_MODE == 0:
-        # q0 = (q0.to(gl.float32) * q_scale * softmax_scale).to(k_cache_ptr.dtype.element_ty)
+        q0 = (q0.to(gl.float32) * q_scale * softmax_scale).to(k_cache_ptr.dtype.element_ty)
         # q0 = (q0.to(gl.float32) * softmax_scale).to(k_cache_ptr.dtype.element_ty)
-        q0 = (q0 * softmax_scale).to(k_cache_ptr.dtype.element_ty)
+        # q0 = (q0 * softmax_scale).to(k_cache_ptr.dtype.element_ty)
 
     # if q0.dtype.is_fp8():
     #     q_scale_offs_base = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + q_grp_offs
@@ -848,7 +848,7 @@ def pa_decode_v2_fp8(
     # v[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     v = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs)
     if v.dtype.is_fp8() and KV_QUANT_MODE == 0:
-        # v = v.to(gl.float32) * v_scale
+        v = v.to(gl.float32) * v_scale
         v = v.to(v_cache_ptr.dtype.element_ty)
     # [MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2] --> [MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2, HEAD_SZ_POW2]
     v = gl.permute(v, [0, 2, 1])
@@ -862,8 +862,8 @@ def pa_decode_v2_fp8(
     exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
     exp_sum = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
     acc = acc / exp_sum
-    # acc = acc.to(COMPUTE_TYPE)
-    acc = acc.to(v_cache_ptr.dtype.element_ty)
+    acc = acc.to(COMPUTE_TYPE)
+    # acc = acc.to(v_cache_ptr.dtype.element_ty)
 
     o_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, pv_mfma_layout))
     o_head_sz_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, pv_mfma_layout))
@@ -1458,8 +1458,8 @@ def paged_attention_decode(
     exp_sums = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
     # tmp_output = torch.empty(
     tmp_output = torch.zeros(
-        *shape_info, head_sz, dtype=torch.float8_e4m3fnuz, device=output.device
-        # *shape_info, head_sz, dtype=output.dtype, device=output.device
+        # *shape_info, head_sz, dtype=torch.float8_e4m3fnuz, device=output.device
+        *shape_info, head_sz, dtype=output.dtype, device=output.device
     )
 
     if query_grp_sz <= 16:
