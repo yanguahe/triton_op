@@ -37,8 +37,9 @@ function copy_recent_amdgcn_files() {
     # dir_name=block_sparse_attn
     # dir_name=block_sparse_attn_lxoptv1
     # dir_name=pa_decode_v2_big_blk_fp8
-    dir_name=pa_decode_v2_fp8
     # dir_name=pa_decode_v2_fp8_rtn
+    # dir_name=pa_decode_v2_fp8
+    dir_name=pa_decode_v2_fp8_gluon
     # local k=2
     local k=200
     # local dest_dir=$PWD/thread_trace/triton_gen_asm
@@ -143,6 +144,7 @@ function run_triton_op {
 
     python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 1024
+    # python ./test_pa_mtp.py -n 8,1 -q 2 -c 4096 -b 32 --block_size 16
 
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 8192 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 1 -b 128 --block_size 16
