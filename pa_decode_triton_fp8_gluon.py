@@ -784,6 +784,38 @@ def pa_decode_v2_fp8(
     kt_temp = gl.reshape(kt_temp, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2 // 2, 2])
     kt0, kt1 = gl.split(kt_temp)
 
+
+    blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout( # 256x128
+        reg_bases=((0,0,1), (0,0,2), (0,0,4), (0,0,8), (4,0,0), (8,0,0), (0,64,0)), # 16 x 8
+        lane_bases=((0,1,0), (0,2,0), (0,4,0), (0,8,0), (1,0,0), (2,0,0)), # 64
+        warp_bases=((0,16,0), (0,32,0)), # 4
+        block_bases=[], # 8
+        shape=[16, 128, 16],
+    )
+    v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
+    v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout)))
+    v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_v_layout)))
+
+    kv_blk_nums2 = gl.convert_layout(kv_blk_nums, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
+    # v_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
+    v_blk_offs = (
+        kv_blk_nums2[:, None, None] * stride_v_b
+        + kv_head_idx * stride_v_nh
+        + v_dim1_offs[None, :, None] * stride_v_hz
+        + v_dim2_offs[None, None, :]
+    )
+
+    # v[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
+    v = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs)
+    if v.dtype.is_fp8() and KV_QUANT_MODE == 0:
+        v = v.to(gl.float32) * v_scale
+        v = v.to(v_cache_ptr.dtype.element_ty)
+    # [MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2] --> [MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2, HEAD_SZ_POW2]
+    v = gl.permute(v, [0, 2, 1])
+    # v[MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2]
+    v = gl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
+
+
     accumulator0 = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2 // 2), dtype=gl.float32, layout=qk_mfma_layout)
     accumulator1 = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2 // 2), dtype=gl.float32, layout=qk_mfma_layout)
     qc = gl.convert_layout(q0, layout=qk_lhs_layout)
@@ -820,40 +852,9 @@ def pa_decode_v2_fp8(
         + m_l_base_offs
     )
     m_l_grp_mask = m_l_base_offs < QUERY_GRP_SZ
-    tl.static_print(max_logit_new.type, m_l_offs.type)
+    # tl.static_print(max_logit_new.type, m_l_offs.type)
     gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
     gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
-
-
-    blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout( # 256x128
-        reg_bases=((0,0,1), (0,0,2), (0,0,4), (0,0,8), (4,0,0), (8,0,0), (0,64,0)), # 16 x 8
-        lane_bases=((0,1,0), (0,2,0), (0,4,0), (0,8,0), (1,0,0), (2,0,0)), # 64
-        warp_bases=((0,16,0), (0,32,0)), # 4
-        block_bases=[], # 8
-        shape=[16, 128, 16],
-    )
-    v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
-    v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout)))
-    v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_v_layout)))
-
-    kv_blk_nums2 = gl.convert_layout(kv_blk_nums, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
-    # v_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
-    v_blk_offs = (
-        kv_blk_nums2[:, None, None] * stride_v_b
-        + kv_head_idx * stride_v_nh
-        + v_dim1_offs[None, :, None] * stride_v_hz
-        + v_dim2_offs[None, None, :]
-    )
-
-    # v[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
-    v = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs)
-    if v.dtype.is_fp8() and KV_QUANT_MODE == 0:
-        v = v.to(gl.float32) * v_scale
-        v = v.to(v_cache_ptr.dtype.element_ty)
-    # [MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2] --> [MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2, HEAD_SZ_POW2]
-    v = gl.permute(v, [0, 2, 1])
-    # v[MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2]
-    v = gl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
 
     accumulator2 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
     pc = gl.convert_layout(p, layout=pv_lhs_layout)

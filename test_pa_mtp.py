@@ -26,9 +26,9 @@ from pa_decode_triton_fp8_gluon import paged_attention_decode as paged_attention
 import triton.language as tl
 
 
-os.environ["TRITON_CACHE_DIR"] = "/home/sijieli2/gluon_cache"
-os.environ["AITER_LOG_MORE"] = "1"
-os.environ["USE_IR_LOC"] = "ttgir"
+# os.environ["TRITON_CACHE_DIR"] = "/home/sijieli2/gluon_cache"
+# os.environ["AITER_LOG_MORE"] = "1"
+# os.environ["USE_IR_LOC"] = "ttgir"
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
