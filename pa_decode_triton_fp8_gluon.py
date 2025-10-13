@@ -561,6 +561,7 @@ def pa_decode_v2_fp8(
     KV_16B_ELE_NUM: tl.constexpr,
     TRANS_V: tl.constexpr,          # [num_blks, num_kv_heads, kv_blk_sz/x, head_sz, x]
     IS_CAUSAL: tl.constexpr,
+    QUANT_MODE: tl.constexpr,
 ):
     """
     Gluon version of paged attention decode kernel with FP8/BF16 support
@@ -569,9 +570,9 @@ def pa_decode_v2_fp8(
 
     # 0 for per_tensor quant
     # 1 for per_token quant
-    Q_QUANT_MODE: gl.constexpr = 0
+    Q_QUANT_MODE: gl.constexpr = QUANT_MODE
     # Q_QUANT_MODE: gl.constexpr = 1
-    KV_QUANT_MODE: gl.constexpr = 0
+    KV_QUANT_MODE: gl.constexpr = QUANT_MODE
     # KV_QUANT_MODE: gl.constexpr = 1
 
     log2e: gl.constexpr = 1.4426950408889634
@@ -860,9 +861,10 @@ def pa_decode_v2_fp8(
     pc = gl.convert_layout(p, layout=pv_lhs_layout)
     vc = gl.convert_layout(v, layout=pv_rhs_layout)
     acc = gl.amd.cdna3.mfma(pc, vc, accumulator2)
+    exp_sum = 1.0 / exp_sum
     exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
     exp_sum = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
-    acc = acc / exp_sum
+    acc = acc * exp_sum
     acc = acc.to(COMPUTE_TYPE)
     # acc = acc.to(v_cache_ptr.dtype.element_ty)
 
@@ -1362,6 +1364,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             KV_16B_ELE_NUM=KV_16B_ELE_NUM,
             TRANS_V=TRANS_V,
             IS_CAUSAL=IS_CAUSAL,
+            QUANT_MODE= os.environ.get('QUANT_MODE', 0),
+            waves_per_eu=2,
         )
 
 
