@@ -747,6 +747,27 @@ def pa_decode_v2_gluon_fp8(
             # if kv element is 1 bytes(fp8), softmax_scale is multiplied with k_scale
             q1 = (softmax_scale * q1.to(gl.float32)).to(COMPUTE_TYPE)
 
+    if CONTIGUOUS_KV_ELEMS_16B_LOAD == 16:
+        if q0.dtype.is_fp8():
+            if Q_QUANT_MODE == 1:
+                q_scale_offs_base = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + qk_row_offs[:, None]
+                # [QUERY_GRP_SZ_POW2, 1]
+                q_scale_val0 = gl.amd.cdna3.buffer_load(
+                    ptr=q_scale, offsets=q_scale_offs_base, mask=qk_row_offs[:, None] < QUERY_GRP_SZ
+                )
+
+    q_scale_val1 = q_scale_val0
+    if Q_SEQ_LEN >= 2:
+        qid = 1
+        if CONTIGUOUS_KV_ELEMS_16B_LOAD == 16:
+            if q0.dtype.is_fp8():
+                if Q_QUANT_MODE == 1:
+                    q_scale_offs_base = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + qk_row_offs[:, None]
+                    # [QUERY_GRP_SZ_POW2, 1]
+                    q_scale_val1 = gl.amd.cdna3.buffer_load(
+                        ptr=q_scale, offsets=q_scale_offs_base + qid * q_scale_stride0, mask=qk_row_offs[:, None] < QUERY_GRP_SZ
+                    )
+
 
     # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
     k_blk_offs = (
@@ -756,10 +777,6 @@ def pa_decode_v2_gluon_fp8(
         + blk_offs[None, None, :, None] * CONTIGUOUS_KV_ELEMS_16B_LOAD
         + contiguous_kv_elems_offs[None, None, None, :]
     )
-    # blk_seq_offs[MAX_NUM_KV_BLKS, 1, KV_BLK_SZ_POW2, 1]
-    # blk_seq_offs = ((kv_blk_start + blk_ids[:, None, None, None]) * KV_BLK_SZ + blk_offs[None, None, :, None])
-    # blk_seq_flatten_offs = gl.reshape(blk_seq_offs, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
-
     k_temp = gl.amd.cdna3.buffer_load(ptr=k_cache_ptr, offsets=k_blk_offs)
     if k_temp.dtype.is_fp8():
         if KV_QUANT_MODE == 0:
@@ -774,45 +791,6 @@ def pa_decode_v2_gluon_fp8(
             # k_scale_offs = tl.broadcast_to(k_scale_offs, QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
             k_scale_val_temp = gl.amd.cdna3.buffer_load(ptr=k_scale, offsets=k_scale_offs)
             # k_scale_val_temp = tl.broadcast_to(k_scale_val_temp, QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
-
-    qk_scale_val0 = k_scale_val_temp
-    qk_scale_val1 = k_scale_val_temp
-    # if k_temp.dtype.is_fp8():
-    #     if q0.dtype.is_fp8():
-    #         if Q_QUANT_MODE == 0:
-    #             qk_scale_val0 = softmax_scale * q_scale_val * k_scale_val_temp
-    #         elif Q_QUANT_MODE == 1:
-    #             q_scale_offs_base = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + qk_row_offs[:, None]
-    #             # [QUERY_GRP_SZ_POW2, 1]
-    #             q_scale_val = gl.amd.cdna3.buffer_load(
-    #                 ptr=q_scale, offsets=q_scale_offs_base, mask=qk_row_offs[:, None] < QUERY_GRP_SZ
-    #             )
-    #             # q_scale_val = tl.broadcast_to(q_scale_val, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
-    #             qk_scale_val0 = softmax_scale * q_scale_val * k_scale_val_temp
-    #     else:
-    #         qk_scale_val0 = softmax_scale * k_scale_val_temp
-    if k_temp.dtype.is_fp8():
-        if q0.dtype.is_fp8():
-            if Q_QUANT_MODE == 1:
-                q_scale_offs_base = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + qk_row_offs[:, None]
-                # [QUERY_GRP_SZ_POW2, 1]
-                q_scale_val = gl.amd.cdna3.buffer_load(
-                    ptr=q_scale, offsets=q_scale_offs_base, mask=qk_row_offs[:, None] < QUERY_GRP_SZ
-                )
-
-    if Q_SEQ_LEN >= 2:
-        qid = 1
-        if k_temp.dtype.is_fp8():
-            if q0.dtype.is_fp8():
-                if Q_QUANT_MODE == 1:
-                    q_scale_offs_base = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + qk_row_offs[:, None]
-                    # [QUERY_GRP_SZ_POW2, 1]
-                    q_scale_val = gl.amd.cdna3.buffer_load(
-                        ptr=q_scale, offsets=q_scale_offs_base + qid * q_scale_stride0, mask=qk_row_offs[:, None] < QUERY_GRP_SZ
-                    )
-                    qk_scale_val1 = softmax_scale * q_scale_val * k_scale_val_temp
-            else:
-                qk_scale_val1 = softmax_scale * k_scale_val_temp
 
     # (MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD) --> (K_HEAD_SZ_POW2_SPLIT, CONTIGUOUS_KV_ELEMS_16B_LOAD, MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2)
     # k_temp = gl.reshape(k_temp, [MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2 // 2, 2, CONTIGUOUS_KV_ELEMS_16B_LOAD])
@@ -884,16 +862,16 @@ def pa_decode_v2_gluon_fp8(
     if k_temp.dtype.is_fp8():
         if q0.dtype.is_fp8():
             if Q_QUANT_MODE == 0:
-                qk_scale_val0 = softmax_scale * q_scale_val * k_scale_val_temp
+                qk_scale_val = softmax_scale * q_scale * k_scale_val_temp
             elif Q_QUANT_MODE == 1:
-                qk_scale_val0 = softmax_scale * q_scale_val * k_scale_val_temp
+                qk_scale_val = softmax_scale * q_scale_val0 * k_scale_val_temp
         else:
-            qk_scale_val0 = softmax_scale * k_scale_val_temp
+            qk_scale_val = softmax_scale * k_scale_val_temp
 
     if CONTIGUOUS_KV_ELEMS_16B_LOAD == 16:
         # kv element is 1 bytes(fp8)
         if KV_QUANT_MODE == 1:
-            qk = qk_scale_val0 * qk
+            qk = qk_scale_val * qk
 
     if v.dtype.is_fp8():
         # 0 for per_tensor quant
