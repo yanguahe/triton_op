@@ -22,7 +22,8 @@ from utils import compare_arrays
 from pa_decode_triton import paged_attention_decode as paged_attention_decode_triton
 # from pa_decode_triton_fp8 import paged_attention_decode as paged_attention_decode_triton_fp8
 from pa_decode_triton_fp8_2 import paged_attention_decode as paged_attention_decode_triton_fp8
-from pa_decode_triton_fp8_gluon import paged_attention_decode as paged_attention_decode_gluon_fp8
+# from pa_decode_triton_fp8_gluon import paged_attention_decode as paged_attention_decode_gluon_fp8
+from pa_decode_triton_fp8_gluon_kv_loop import paged_attention_decode as paged_attention_decode_gluon_fp8
 import triton.language as tl
 
 

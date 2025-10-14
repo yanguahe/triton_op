@@ -22,6 +22,8 @@ export HIP_VISIBLE_DEVICES=3
 # export LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/torch/lib:$LD_LIBRARY_PATH
 # export PATH=/mnt/raid0/heyanguang/code/poc_kl/scripts/common:$PATH
 
+rocm-smi | egrep "$HIP_VISIBLE_DEVICES    |Device"
+
 
 
 
@@ -144,7 +146,7 @@ function run_triton_op {
 
 
     python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
-    python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 2 -c 4096 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 16,1 -q 2 -c 4096 -b 128 --block_size 16
