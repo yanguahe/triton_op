@@ -12,9 +12,9 @@ alias bt="/opt/rocm/bin/hipcc --offload-arch=gfx942  -g mla.cpp -o mla.exe"
 
 # export HIP_VISIBLE_DEVICES=0
 # export HIP_VISIBLE_DEVICES=1
-# export HIP_VISIBLE_DEVICES=2
+export HIP_VISIBLE_DEVICES=3
 # export HIP_VISIBLE_DEVICES=4
-export HIP_VISIBLE_DEVICES=6
+# export HIP_VISIBLE_DEVICES=6
 # export HIP_VISIBLE_DEVICES=7
 
 
@@ -39,7 +39,7 @@ function copy_recent_amdgcn_files() {
     # dir_name=pa_decode_v2_big_blk_fp8
     # dir_name=pa_decode_v2_fp8_rtn
     # dir_name=pa_decode_v2_fp8
-    dir_name=pa_decode_v2_fp8_gluon
+    dir_name=pa_decode_v2_gluon_fp8
     # local k=2
     local k=200
     # local dest_dir=$PWD/thread_trace/triton_gen_asm
@@ -56,7 +56,8 @@ function copy_recent_amdgcn_files() {
     # kernel_name=block_sparse_attn
     # kernel_name=sparse_attn
     # kernel_name=pa_decode_v2_big_blk_fp8
-    kernel_name=pa_decode_v2_fp8
+    # kernel_name=pa_decode_v2_fp8
+    kernel_name=pa_decode_v2_gluon_fp8
 
     # file_filter="*.amdgcn"
     file_filter="*$kernel_name*"
@@ -97,7 +98,7 @@ function copy_recent_amdgcn_files() {
 
 
 function run_triton_op {
-    # rm -rf ~/.triton/cache
+    rm -rf ~/.triton/cache
     export AITER_LOG_MORE=1
     # unset AITER_LOG_MORE
     export TRITON_PRINT_AUTOTUNING=1
@@ -142,10 +143,11 @@ function run_triton_op {
     # python ./test_pa_mtp.py -n 8,1 -c 4096 -b 32 --trans_v
 
 
-    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
+    python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
+    python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 2 -c 4096 -b 128 --block_size 16
-    python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
-    python ./test_pa_mtp.py -n 16,1 -q 2 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -q 2 -c 4096 -b 128 --block_size 16
 
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 1024
@@ -187,7 +189,7 @@ function run_triton_op {
     # ll ~/.triton/cache/*/*.hsaco
     # md5sum ~/.triton/cache/*/*.hsaco
 
-    # copy_recent_amdgcn_files
+    copy_recent_amdgcn_files
 }
 
 
@@ -206,7 +208,9 @@ function run_aiter_op {
 
 
 function get_triton_pa_thread_trace {
+    rm -rf ~/.triton/cache
     pushd $PWD
+    export AITER_LOG_MORE=1
 
     # KERNEL=_fwd_kernel
     # KERNEL=_attn_fwd
@@ -214,13 +218,18 @@ function get_triton_pa_thread_trace {
     # KERNEL=matmul_ori_kernel
     # KERNEL=matmul_ori_kernel_v2
     # KERNEL=_triton_mixed_sparse_attn_fwd_kernel_v1
-    KERNEL=_triton_block_sparse_attn_fwd_kernel_v1
+    # KERNEL=_triton_block_sparse_attn_fwd_kernel_v1
+    KERNEL=pa_decode_v2_gluon_fp8
+    # KERNEL=pa_bf16_pertokenFp8_gqa8_2tg_4w_uhp
     # KERNEL=matmul_kernel
     # KERNEL=_fwd_grouped_kernel_stage1_rope
     # export KERNEL_VERSION="triton_pa_prefill_bf16"
     # export KERNEL_VERSION="triton_mha_fwd_bf16"
     # export KERNEL_VERSION="triton_${KERNEL}_bf16"
-    export KERNEL_VERSION="triton_${KERNEL}_bf16_v2"
+    # export KERNEL_VERSION="triton_${KERNEL}_bf16_v2"
+
+    export KERNEL_VERSION="${KERNEL}_v1"
+    # export KERNEL_VERSION="${KERNEL}_v1_rm_v_scale"
 
     # pytest ./test_pa_prefill.py::test_contexted_kv_attention -v -s -k "0-cuda:0-auto-dtype1-128-1-4"
     # pytest ./test_pa_prefill.py::test_mha -v -s -k "False-True-0.0-False-False-128-4-4-1024-2048-2"
@@ -240,7 +249,8 @@ function get_triton_pa_thread_trace {
         mkdir -p ${trace_dir}
 
         rocprofv2 -d ${trace_dir} -i ./thread_trace/att.txt --plugin att auto --mode file,csv -o ${trace_dir}/csv_${KERNEL_VERSION} \
-        python ./block_sparse_attn.py
+        python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
+        # python ./block_sparse_attn.py
         # python ./mixed_sparse_attn.py
         # python ./00-gemm.py
         # python $aiter_root_dir/op_tests/op_benchmarks/triton/bench_mla_decode.py -b 80 --model all --seqlen 8192 -equal_seqlens
