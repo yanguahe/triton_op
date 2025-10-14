@@ -690,7 +690,6 @@ def pa_decode_v2_fp8(
     q_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
     # load q[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     q0 = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs_base, mask=q_mask)
-
     # Initialize q1, q2, q3 with q0
     q1 = q0
     q2 = q0
@@ -772,7 +771,8 @@ def pa_decode_v2_fp8(
     # v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
     v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout)))
     v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_v_layout)))
-
+    v_dim2_offs2 = gl.arange(0, HEAD_SZ)
+    
     kv_blk_nums2 = gl.convert_layout(kv_blk_nums, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
     # v_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     v_blk_offs = (
@@ -787,16 +787,16 @@ def pa_decode_v2_fp8(
     if v.dtype.is_fp8():
         # 0 for per_tensor quant
         if KV_QUANT_MODE == 0:
-            v = gl.load(v_scale) * v.to(gl.float32)
-            v = v.to(v_cache_ptr.dtype.element_ty)
+            v_scale_val = gl.load(v_scale)
         # 1 for per_token quant
         elif KV_QUANT_MODE == 1:
-            v_scale_offs = kv_blk_nums2[:, None, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + v_dim2_offs[None, None, :]
+            v_scale_offs = kv_blk_nums[:, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + v_dim2_offs2[None, :]
+            v_scale_offs = gl.convert_layout(v_scale_offs, layout=pv_mfma_layout)
             # [MAX_NUM_KV_BLKS, 1, KV_BLK_SZ_POW2]
             v_scale_val = gl.amd.cdna3.buffer_load(ptr=v_scale, offsets=v_scale_offs)
             # v_scale_val = tl.broadcast_to(v_scale_val, MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2)
-            v = v_scale_val * v.to(gl.float32)
-            v = v.to(v_cache_ptr.dtype.element_ty)
+            # v = v_scale_val * v.to(gl.float32)
+            # v = v.to(v_cache_ptr.dtype.element_ty)
 
     # [MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2] --> [MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2, HEAD_SZ_POW2]
     v = gl.permute(v, [0, 2, 1])
@@ -809,6 +809,7 @@ def pa_decode_v2_fp8(
     QID = 0
     q = q0
     qc = gl.convert_layout(q, layout=qk_lhs_layout)
+    # qc = q_shared.load(qk_lhs_layout)
     kc0 = gl.convert_layout(kt0, layout=qk_rhs_layout)
     kc1 = gl.convert_layout(kt1, layout=qk_rhs_layout)
     qk0 = gl.amd.cdna3.mfma(qc, kc0, accumulator0)
@@ -857,7 +858,7 @@ def pa_decode_v2_fp8(
     accumulator2 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
     pc = gl.convert_layout(p, layout=pv_lhs_layout)
     vc = gl.convert_layout(v, layout=pv_rhs_layout)
-    acc = gl.amd.cdna3.mfma(pc, vc, accumulator2)
+    acc = gl.amd.cdna3.mfma(pc, vc, accumulator2) * v_scale_val
     exp_sum_cvt = gl.convert_layout(exp_sum0[:, None], layout=pv_mfma_layout)
     # exp_sum_cvt = tl.broadcast_to(exp_sum_cvt, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
     acc = acc / exp_sum_cvt
@@ -921,7 +922,7 @@ def pa_decode_v2_fp8(
         accumulator2 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
         pc = gl.convert_layout(p, layout=pv_lhs_layout)
         vc = gl.convert_layout(v, layout=pv_rhs_layout)
-        acc = gl.amd.cdna3.mfma(pc, vc, accumulator2)
+        acc = gl.amd.cdna3.mfma(pc, vc, accumulator2) * v_scale_val
         exp_sum_cvt = gl.convert_layout(exp_sum1[:, None], layout=pv_mfma_layout)
         # exp_sum_cvt = tl.broadcast_to(exp_sum_cvt, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
         acc = acc / exp_sum_cvt
