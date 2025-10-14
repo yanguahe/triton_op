@@ -669,6 +669,8 @@ def pa_decode_v2_fp8(
     kv_blk_start = seq_part_idx * MAX_NUM_KV_BLKS
     qk_row_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_linear_layout))
     qk_col_offs = kv_blk_start * KV_BLK_SZ + gl.arange(0, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, qk_linear_layout))
+    # v_scale_tb_offs = gl.arange(0, 1)
+    v_scale_tb_offs = gl.full([1], 0, gl.int32)
 
     # load alibi slopes[QUERY_GRP_SZ_POW2]
     if alibi_slopes is None:
@@ -681,6 +683,7 @@ def pa_decode_v2_fp8(
     masked_blk_ids = gl.where(blk_ids < num_kv_blks, blk_ids, 0)
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
     kv_blk_nums = gl.amd.cdna3.buffer_load(ptr=blk_tables_start_ptr + kv_blk_start, offsets=masked_blk_ids)
+    v_scale_blk_id = gl.amd.cdna3.buffer_load(ptr=blk_tables_start_ptr + kv_blk_start, offsets=v_scale_tb_offs)
 
     q_offs_base = (
         seq_idx * Q_SEQ_LEN * stride_q_s
@@ -804,12 +807,13 @@ def pa_decode_v2_fp8(
             v = v.to(v_cache_ptr.dtype.element_ty)
         # 1 for per_token quant
         elif KV_QUANT_MODE == 1:
-            v_scale_offs = kv_blk_nums2[:, None, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + v_dim2_offs[None, None, :]
+            # v_scale_offs = kv_blk_nums2[:, None, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + v_dim2_offs[None, None, :]
+            v_scale_offs = v_scale_blk_id * kv_scale_stride0 + kv_head_idx * kv_scale_stride1
             # [MAX_NUM_KV_BLKS, 1, KV_BLK_SZ_POW2]
             v_scale_val = gl.amd.cdna3.buffer_load(ptr=v_scale, offsets=v_scale_offs)
             # v_scale_val = tl.broadcast_to(v_scale_val, MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2)
-            v = v_scale_val * v.to(gl.float32)
-            v = v.to(v_cache_ptr.dtype.element_ty)
+            # v = v_scale_val * v.to(gl.float32)
+            # v = v.to(v_cache_ptr.dtype.element_ty)
 
     # [MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2] --> [MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2, HEAD_SZ_POW2]
     v = gl.permute(v, [0, 2, 1])
@@ -851,7 +855,8 @@ def pa_decode_v2_fp8(
     # p[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     p = tl.math.exp2((qk - max_logit_new0[:, None]) * log2e)
     exp_sum0 = gl.sum(p, axis=1)
-    # exp_sum0 = 1.0 / exp_sum0
+    # exp_sum0 = exp_sum0 / v_scale_val
+    exp_sum0 = v_scale_val / exp_sum0
 
     if CONTIGUOUS_KV_ELEMS_16B_LOAD == 16:
         # kv element is 1 bytes(fp8)
@@ -876,8 +881,8 @@ def pa_decode_v2_fp8(
     acc = gl.amd.cdna3.mfma(pc, vc, accumulator2)
     exp_sum_cvt = gl.convert_layout(exp_sum0[:, None], layout=pv_mfma_layout)
     # exp_sum_cvt = tl.broadcast_to(exp_sum_cvt, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
-    acc = acc / exp_sum_cvt
-    # acc = acc * exp_sum_cvt
+    # acc = acc / exp_sum_cvt
+    acc = acc * exp_sum_cvt
     acc0 = acc.to(COMPUTE_TYPE)
     # acc = acc.to(v_cache_ptr.dtype.element_ty)
 

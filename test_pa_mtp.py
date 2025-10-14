@@ -809,7 +809,7 @@ l_qlen = [1, 2]
 l_ctx_len = [2048, 4096, 8192]
 # l_ctx_len = [8192, 8193, 32768, 32769]
 # l_batch_size = [128, 32]
-l_batch_size = [4, 32, 128]
+l_batch_size = [4, 32, 80, 128]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

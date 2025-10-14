@@ -142,10 +142,11 @@ function run_triton_op {
     # python ./test_pa_mtp.py -n 8,1 -c 4096 -b 32 --trans_v
 
 
-    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
+    python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
+    python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 2 -c 4096 -b 128 --block_size 16
-    python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
-    python ./test_pa_mtp.py -n 16,1 -q 2 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -q 2 -c 4096 -b 128 --block_size 16
 
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 1024
