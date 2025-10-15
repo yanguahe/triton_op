@@ -790,9 +790,11 @@ def pa_decode_v2_fp8(
             v_scale_val = gl.load(v_scale)
         # 1 for per_token quant
         elif KV_QUANT_MODE == 1:
-            v_scale_offs = kv_blk_nums[:, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + v_dim2_offs2[None, :]
-            v_scale_offs = gl.convert_layout(v_scale_offs, layout=pv_mfma_layout)
-            # [MAX_NUM_KV_BLKS, 1, KV_BLK_SZ_POW2]
+            v_scale_offs = kv_blk_nums[:, None, None, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + blk_offs[None, None, :, None]
+            v_scale_offs = gl.permute(v_scale_offs, [0, 2, 1, 3])
+            v_scale_offs = gl.reshape(v_scale_offs, [1, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
+            v_scale_offs = gl.convert_layout(v_scale_offs, layout=qk_linear_layout)
+            # k_scale_offs = tl.broadcast_to(k_scale_offs, QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
             v_scale_val = gl.amd.cdna3.buffer_load(ptr=v_scale, offsets=v_scale_offs)
             # v_scale_val = tl.broadcast_to(v_scale_val, MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2)
             # v = v_scale_val * v.to(gl.float32)
@@ -836,6 +838,7 @@ def pa_decode_v2_fp8(
     # p[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     p = tl.math.exp2((qk - max_logit_new0[:, None]) * log2e)
     exp_sum0 = gl.sum(p, axis=1)
+    p *= v_scale_val
     # exp_sum0 = 1.0 / exp_sum0
 
     if CONTIGUOUS_KV_ELEMS_16B_LOAD == 16:
@@ -858,7 +861,7 @@ def pa_decode_v2_fp8(
     accumulator2 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
     pc = gl.convert_layout(p, layout=pv_lhs_layout)
     vc = gl.convert_layout(v, layout=pv_rhs_layout)
-    acc = gl.amd.cdna3.mfma(pc, vc, accumulator2) * v_scale_val
+    acc = gl.amd.cdna3.mfma(pc, vc, accumulator2) 
     exp_sum_cvt = gl.convert_layout(exp_sum0[:, None], layout=pv_mfma_layout)
     # exp_sum_cvt = tl.broadcast_to(exp_sum_cvt, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
     acc = acc / exp_sum_cvt
@@ -922,7 +925,7 @@ def pa_decode_v2_fp8(
         accumulator2 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
         pc = gl.convert_layout(p, layout=pv_lhs_layout)
         vc = gl.convert_layout(v, layout=pv_rhs_layout)
-        acc = gl.amd.cdna3.mfma(pc, vc, accumulator2) * v_scale_val
+        acc = gl.amd.cdna3.mfma(pc, vc, accumulator2)
         exp_sum_cvt = gl.convert_layout(exp_sum1[:, None], layout=pv_mfma_layout)
         # exp_sum_cvt = tl.broadcast_to(exp_sum_cvt, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
         acc = acc / exp_sum_cvt
