@@ -425,6 +425,7 @@ def run_gluon_fp8(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     num_seq_partitions: int = 0,  # TODO use this below
+    q_seq_len_ori: int = 0,  # TODO use this below
     alibi_slopes: torch.Tensor = None,
     max_logits: torch.Tensor = None,
     exp_sums: torch.Tensor = None,
@@ -445,6 +446,7 @@ def run_gluon_fp8(
         v_scale,
         num_seq_partitions=0,
         alibi_slopes=None,
+        q_seq_len_ori=q_seq_len_ori,
     )
     return output, result
 
@@ -701,10 +703,9 @@ def test_pa_mtp(
         # query,
         # k_cache,
         # v_cache,
-        q_quant,
+        q_quant if qlen == 1 else q_quant.reshape([batch_size, -1, head_size]),
         k_quant_,
         v_quant_,
-
         seq_lens,
         block_tables,
         softmax_scale,
@@ -714,12 +715,13 @@ def test_pa_mtp(
         k_scale=k_scale_asm,
         v_scale=v_scale_asm,
         num_seq_partitions=0,
+        q_seq_len_ori=qlen,
         alibi_slopes=None,
     )
     us_triton = us_triton['triton']
     err_triton_noquant = checkAllclose(
         out_ref,
-        gluon_fp8_output,
+        gluon_fp8_output.reshape(batch_size * qlen, -1, head_dim),
         atol=fp8_diff_thr,
         rtol=fp8_diff_thr,
         msg=f"[torch vs gluon_fp8][   Quant]: {us_triton:>8.2f} us......",

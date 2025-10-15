@@ -550,6 +550,7 @@ def pa_decode_v2_fp8(
     kv_scale_stride0,
     kv_scale_stride1,
     Q_SEQ_LEN: tl.constexpr,
+    Q_SEQ_LEN_ORI: tl.constexpr,
     COMPUTE_TYPE: tl.constexpr,
     HEAD_SZ: tl.constexpr,
     HEAD_SZ_POW2: tl.constexpr,
@@ -837,11 +838,21 @@ def pa_decode_v2_fp8(
         qk += (alibi_slope[:, None] * (qk_col_offs - kv_seq_len + 1)[None, :]).to(gl.float32)
 
     qk_bound_mask = (qk_row_offs[:, None] < QUERY_GRP_SZ)
+
+    # if IS_CAUSAL:
+    #     causal_mask = qk_col_offs[None, :] < kv_seq_len - (Q_SEQ_LEN - 1 - QID)
+    # else:
+    #     causal_mask = qk_col_offs[None, :] < kv_seq_len
+    # qk_bound_mask = qk_bound_mask & causal_mask
+
     if IS_CAUSAL:
-        causal_mask = qk_col_offs[None, :] < kv_seq_len - (Q_SEQ_LEN - 1 - QID)
+        mask_stride = QUERY_GRP_SZ_POW2 // Q_SEQ_LEN_ORI
+        seq_m_extand = Q_SEQ_LEN_ORI - 1 - qk_row_offs // mask_stride
+        qk_bound_mask = qk_bound_mask & ((seq_m_extand[:, None] + qk_col_offs[None, :]) < kv_seq_len)
     else:
         causal_mask = qk_col_offs[None, :] < kv_seq_len
-    qk_bound_mask = qk_bound_mask & causal_mask
+        qk_bound_mask = qk_bound_mask & causal_mask
+
     # if [0, SEQ_PARTITION_SZ) are all -inf, the result will be nan
     # so, we use -1e37 other than -inf
     # qk = tl.where(qk_bound_mask, qk, float("-inf"))
@@ -1108,6 +1119,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     kv_scale_stride1,
     kv_type,
     Q_SEQ_LEN,
+    Q_SEQ_LEN_ORI,
     COMPUTE_TYPE,
     HEAD_SZ,
     HEAD_SZ_POW2,
@@ -1208,6 +1220,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             kv_scale_stride0,
             kv_scale_stride1,
             Q_SEQ_LEN=Q_SEQ_LEN,
+            Q_SEQ_LEN_ORI=Q_SEQ_LEN_ORI,
             COMPUTE_TYPE=COMPUTE_TYPE,
             HEAD_SZ=HEAD_SZ,
             HEAD_SZ_POW2=HEAD_SZ_POW2,
@@ -1287,6 +1300,7 @@ def paged_attention_decode(
     k_scale: torch.Tensor,      # [num_blks, num_kv_heads, kv_blk_sz, 1]
     v_scale: torch.Tensor,      # [num_blks, num_kv_heads, kv_blk_sz, 1]
     num_seq_partitions: int = 0,  # TODO use this below
+    q_seq_len_ori: int = 1,
     alibi_slopes: torch.Tensor = None,
 ) -> None:
     """
@@ -1306,7 +1320,7 @@ def paged_attention_decode(
     equi_query_grp_sz_pow2 = triton.next_power_of_2(equi_query_grp_sz)
     kv_blk_sz_pow2 = triton.next_power_of_2(kv_blk_sz)
     head_sz_pow2 = triton.next_power_of_2(head_sz)
-    is_causal = q_seq_len > 1
+    is_causal = q_seq_len_ori > 1
     # is_causal = False
     num_seqs = batch_size
     kv_16b_ele_num = 16 // key_cache.dtype.itemsize
@@ -1415,6 +1429,7 @@ def paged_attention_decode(
         k_scale.stride(1),
         kv_type=compute_type,
         Q_SEQ_LEN=q_seq_len,
+        Q_SEQ_LEN_ORI=q_seq_len_ori,
         COMPUTE_TYPE=compute_type,
         HEAD_SZ=head_sz,
         HEAD_SZ_POW2=head_sz_pow2,
