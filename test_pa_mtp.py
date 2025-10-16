@@ -637,7 +637,9 @@ def test_pa_mtp(
     triton_output_md5 = hashlib.md5(triton_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
     print(f"out_ref_noquant_md5={out_ref_noquant_md5}")
     print(f"gluon_output_md5={triton_output_md5}")
-
+    kt_us = us_triton
+    bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant2_.dtype.itemsize + 2 * qlen * num_query_heads * query.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
+    ret["gluon_fp8_bandwith(TB/s)"] = bandwith
 
     # print(f"batch_size={batch_size}")
     # print(f"seq_lens={seq_lens}")
