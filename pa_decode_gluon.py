@@ -52,6 +52,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
     k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
     v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    sink_ptr,  # [num_query_heads]
     blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
     seq_lens_ptr,       # [num_seqs]
     scale,
@@ -83,6 +84,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     KV_BLK_SZ: gl.constexpr,
     KV_BLK_SZ_POW2: gl.constexpr,
     SEQ_PARTITION_SZ: gl.constexpr,
+    USE_SINKS: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
 ):
     """
     #TODO: Add Doc
@@ -90,6 +93,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
 
     seq_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
+    num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
     seq_part_idx = gl.program_id(2)
 
     log2e: gl.constexpr = 1.4426950408889634
@@ -154,7 +158,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # in the same row instead of column, which is good for chained dot and global write.
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         # version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[4, 1]
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=3, instr_shape=[16, 16, 16], transposed=True, warps_per_cta=[1, 4]
     )
     qk_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=qk_mfma_layout, k_width=8
@@ -164,7 +168,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     )
 
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[1, 4]
+        version=3, instr_shape=[16, 16, 16], transposed=False, warps_per_cta=[1, 4]
     )
     pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=pv_mfma_layout, k_width=16
@@ -240,9 +244,16 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # q = gl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
     q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs, mask=q_mask)
     # q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs)
-    q = (q * scale).to(compute_type)
+    # q = (q * scale).to(compute_type)
     q_shared = gl.allocate_shared_memory(q.dtype, q.shape, shared_a_layout, q)
-
+    if USE_SINKS:
+    #     M = gl.full([QUERY_GRP_SZ_POW2], float("-inf"), dtype=tl.float32)
+    # else:
+        M = gl.load(
+            sink_ptr + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs),
+            mask=(kv_head_idx * QUERY_GRP_SZ + q_grp_offs) < num_query_heads,
+            other=float("-inf"),
+        ).to(dtype=tl.float32)
     # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
     k_blk_offs = (
         kv_blk_nums[:, None, None, None] * stride_k_b
@@ -265,8 +276,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # k[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
     # k_0 = gl.load(k_cache_ptr + k_blk_offs)
     k_0 = gl.amd.cdna3.buffer_load(ptr=k_cache_ptr, offsets=k_blk_offs)
-    k = k_0.to(gl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
-    k = k.to(compute_type)
+    k_scale_val = gl.load(k_scale) if k_0.dtype.is_fp8() else 1.0
+    # k = k_0.to(gl.float32) * 
+    k = k_0.to(compute_type)
     # (MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD) --> (K_HEAD_SZ_POW2_SPLIT, CONTIGUOUS_KV_ELEMS_16B_LOAD, MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2)
     kt_temp = tl.permute(k, [1, 3, 0, 2])
     # k[HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
@@ -284,7 +296,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # qc = gl.convert_layout(q, layout=qk_lhs_layout)
     qc = q_shared.load(qk_lhs_layout)
     kc = gl.convert_layout(kt, layout=qk_rhs_layout)
-    qk = gl.amd.cdna3.mfma(qc, kc, accumulator)
+    qk = gl.amd.cdna3.mfma(qc, kc, accumulator) * scale * k_scale_val
     # qk = qk.to(compute_type)
 
     # blk_seq_flatten_offs = gl.reshape(blk_seq_offs, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
@@ -295,18 +307,26 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     #     qk,
     #     float("-inf"),
     # )
-
+    if SLIDING_WINDOW > 0:
+        qk = gl.where((seq_len - 1 + 1 - seq_start_idx  - gl.arange(0, SEQ_PARTITION_SZ))[None, :] < SLIDING_WINDOW, qk, -1e37)
+        # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 7:
+        #     print("qk:", qk)
     if alibi_slopes is not None:
         qk += (alibi_slope[:, None] * (qk_col_offs - seq_len + 1)[None, :]).to(gl.float32)
+    
     qk = gl.where(
         (qk_row_offs[:, None] < QUERY_GRP_SZ) & (qk_col_offs[None, :] < seq_len),
         qk,
         float("-inf"),
     )
-
+    # gl.static_print(qk.shape, qk_row_offs.shape, qk_col_offs.shape)
     max_logit_new = gl.max(qk, axis=1)
+    max_logit_new = gl.where(max_logit_new > float("-inf"), max_logit_new, 0.0)
+    
     # p[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     # p = gl.math.exp2((qk - max_logit_new[:, None]) * log2e)
+    if USE_SINKS:
+        M = tl.math.exp2((gl.convert_layout(M[:, None], layout=qk_mfma_layout) - max_logit_new[:, None]) * log2e)
     p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
     exp_sum = gl.sum(p, axis=1)
     p = p.to(compute_type)
@@ -401,8 +421,10 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
 
     # v[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     # v_0 = gl.load(v_cache_ptr + v_blk_offs)
+    
     v_0 = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs)
-    # v = v_0.to(gl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
+    v_scale_val = gl.load(v_scale) if v_0.dtype.is_fp8() else 1.0
+    # v = v_0.to(gl.float32) * v_scale_val
     v = v_0.to(compute_type)
     # [MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2] --> [MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2, HEAD_SZ_POW2]
     v = gl.permute(v, [0, 2, 1])
@@ -435,10 +457,14 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # acc = gl.dot(p, v, out_dtype=gl.float32)
     # acc = acc / exp_sum[:, None]
     accumulator2 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
+
     pc = gl.convert_layout(p, layout=pv_lhs_layout)
     vc = gl.convert_layout(v, layout=pv_rhs_layout)
-    acc = gl.amd.cdna3.mfma(pc, vc, accumulator2)
+    
+    acc = gl.amd.cdna3.mfma(pc, vc, accumulator2) * v_scale_val
     exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
+    if USE_SINKS:
+        exp_sum += gl.convert_layout(M, layout=pv_mfma_layout)
     exp_sum = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
     # exp_sum = tl.broadcast_to(exp_sum[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
     # exp_sum = gl.convert_layout(exp_sum, layout=pv_mfma_layout)
@@ -484,6 +510,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
     k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
     v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    sink_ptr,           # [num_query_heads]
     blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
     seq_lens_ptr,       # [num_seqs]
     scale,
@@ -516,6 +543,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     KV_BLK_SZ,
     KV_BLK_SZ_POW2,
     SEQ_PARTITION_SZ,
+    USE_SINKS,
+    SLIDING_WINDOW
 ):
     # Use ttgir as input
     # print(f"_paged_attn_decode_v2_w_dot_kernel_reshape_wrapper")
@@ -570,6 +599,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
             k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
             v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+            sink_ptr,           # [num_query_heads]
             blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
             seq_lens_ptr,       # [num_seqs]
             scale,
@@ -601,6 +631,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             KV_BLK_SZ=KV_BLK_SZ,
             KV_BLK_SZ_POW2=KV_BLK_SZ_POW2,
             SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
+            USE_SINKS=USE_SINKS,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
 
 @perftest()
@@ -666,6 +698,8 @@ def paged_attention_decode(
     v_scale: torch.Tensor,
     num_seq_partitions: int = 0,  # TODO use this below
     alibi_slopes: torch.Tensor = None,
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: int = 0,
 ) -> None:
     """
     #TODO: Add Doc
@@ -742,6 +776,7 @@ def paged_attention_decode(
                 query,
                 key_cache,
                 value_cache,
+                sinks,
                 block_tables,
                 seq_lens,
                 max_seq_len,
@@ -749,9 +784,10 @@ def paged_attention_decode(
                 num_kv_heads,
                 attn_scale,
                 alibi_slopes,
-                k_scale.item(),
-                v_scale.item(),
+                k_scale,
+                v_scale,
                 max_num_partitions,
+                sliding_window=sliding_window,
             )
             return perf_time
 
@@ -1135,6 +1171,7 @@ def paged_attn_decode_v2(
     query: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz],
     key_cache: torch.Tensor,  # [num_blks, num_kv_heads, kv_blk_sz, head_sz] ,
     value_cache: torch.Tensor,  # [num_blks, num_kv_heads, kv_blk_sz, head_sz] ,
+    sinks: Optional[torch.Tensor],  # [num_query_heads],
     block_tables: torch.Tensor,  # [num_seqs, max_num_blks_per_seq],
     seq_lens: torch.Tensor,  # [num_seqs],
     max_seq_len: int,
@@ -1142,14 +1179,15 @@ def paged_attn_decode_v2(
     num_kv_heads: int,
     scale: float,
     alibi_slopes: Optional[torch.Tensor],
-    k_scale: float,
-    v_scale: float,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
     max_num_partitions: int,
     tp_rank: int = 0,
     blocksparse_local_blocks: int = 0,
     blocksparse_vert_stride: int = 0,
     blocksparse_block_size: int = 64,
     blocksparse_head_sliding_step: int = 0,
+    sliding_window: int = 0,
 ):
     """
     #TODO: Add Doc
@@ -1296,6 +1334,7 @@ def paged_attn_decode_v2(
             query,
             key_cache,
             value_cache,
+            sinks,
             block_tables,
             seq_lens,
             scale,
@@ -1328,6 +1367,8 @@ def paged_attn_decode_v2(
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            USE_SINKS=sinks is not None,
+            SLIDING_WINDOW=sliding_window,
         )
         grid = (num_seqs, num_kv_heads, 1)
         _, reduce_time = _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
