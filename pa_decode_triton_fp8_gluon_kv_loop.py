@@ -591,7 +591,8 @@ def pa_decode_v2_gluon_fp8(
     log2e: gl.constexpr = 1.4426950408889634
     CONTIGUOUS_KV_ELEMS_16B_LOAD: gl.constexpr = KV_16B_ELE_NUM
     K_HEAD_SZ_POW2_SPLIT: gl.constexpr = HEAD_SZ_POW2 // CONTIGUOUS_KV_ELEMS_16B_LOAD
-    KV_COMPUTE_BLOCK_SIZE: gl.constexpr = 128
+    # KV_COMPUTE_BLOCK_SIZE: gl.constexpr = 128
+    KV_COMPUTE_BLOCK_SIZE: gl.constexpr = 256
     MAX_NUM_KV_BLKS: gl.constexpr = KV_COMPUTE_BLOCK_SIZE // KV_BLK_SZ
 
     # ==================== Layout Definitions ====================
@@ -651,8 +652,8 @@ def pa_decode_v2_gluon_fp8(
     #     shape=[16, KV_COMPUTE_BLOCK_SIZE],
     # )
     qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
-        # reg_bases=((0,1), (0,2), (0,64), (0,128)), # 16 x 8
-        reg_bases=((0,1), (0,2), (0,64)), # 16 x 8
+        reg_bases=((0,1), (0,2), (0,64), (0,128)), # 16 x 8
+        # reg_bases=((0,1), (0,2), (0,64)), # 16 x 8
         lane_bases=((1,0), (2,0), (4,0), (8,0), (0,4), (0,8)), # 64
         warp_bases=((0,16), (0,32)), # 4
         block_bases=[], # 8
@@ -848,11 +849,13 @@ def pa_decode_v2_gluon_fp8(
                 k_scale_val_temp = gl.amd.cdna3.buffer_load(ptr=k_scale, offsets=k_scale_offs)
                 # k_scale_val_temp = tl.broadcast_to(k_scale_val_temp, QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2)
 
-        # (MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD) --> (K_HEAD_SZ_POW2_SPLIT, CONTIGUOUS_KV_ELEMS_16B_LOAD, MAX_NUM_KV_BLKS, KV_BLK_SZ_POW2)
-        # k_temp = gl.reshape(k_temp, [MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2 // 2, 2, CONTIGUOUS_KV_ELEMS_16B_LOAD])
-        # kt_temp = gl.permute(k_temp, [1, 4, 0, 2, 3])
-        # kt_temp = gl.reshape(kt_temp, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2 // 2, 2])
-        # kt0, kt1 = gl.split(kt_temp)
+                # [MAX_NUM_KV_BLKS, 1, KV_BLK_SZ_POW2, 1]
+                v_scale_offs = kv_blk_nums[:, None, None, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + blk_offs[None, None, :, None]
+                v_scale_val = gl.amd.cdna3.buffer_load(ptr=v_scale, offsets=v_scale_offs)
+                v_scale_val = gl.permute(v_scale_val, [0, 2, 1, 3])
+                v_scale_val = gl.reshape(v_scale_val, [1, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
+                v_scale_val = gl.convert_layout(v_scale_val, layout=qk_linear_layout)
+
         kt_temp = gl.permute(k_temp, [1, 3, 0, 2])
         kt_temp = gl.reshape(kt_temp, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
 
@@ -867,15 +870,14 @@ def pa_decode_v2_gluon_fp8(
         )
         # v[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
         v = gl.amd.cdna3.buffer_load(ptr=v_cache_ptr, offsets=v_blk_offs)
-        if v.dtype.is_fp8():
-            # 1 for per_token quant
-            if KV_QUANT_MODE == 1:
-                v_scale_offs = kv_blk_nums2[:, None, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + v_dim2_offs[None, None, :]
-                # [MAX_NUM_KV_BLKS, 1, KV_BLK_SZ_POW2]
-                v_scale_val = gl.amd.cdna3.buffer_load(ptr=v_scale, offsets=v_scale_offs)
-                # v_scale_val = tl.broadcast_to(v_scale_val, MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2)
-                # v = v_scale_val * v.to(gl.float32)
-                # v = v.to(v_cache_ptr.dtype.element_ty)
+
+        # if v.dtype.is_fp8():
+        #     # 1 for per_token quant
+        #     if KV_QUANT_MODE == 1:
+        #         v_scale_offs = kv_blk_nums2[:, None, None] * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + v_dim2_offs[None, None, :]
+        #         # v_scale_offs = v_scale_blk_id * kv_scale_stride0 + kv_head_idx * kv_scale_stride1
+        #         # [MAX_NUM_KV_BLKS, 1, KV_BLK_SZ_POW2]
+        #         v_scale_val = gl.amd.cdna3.buffer_load(ptr=v_scale, offsets=v_scale_offs)
 
 
         # accumulator0 = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2 // 2), dtype=gl.float32, layout=qk_mfma_layout)
@@ -911,19 +913,15 @@ def pa_decode_v2_gluon_fp8(
             if KV_QUANT_MODE == 1:
                 qk = qk_scale_val * qk
 
-        # v_scale_val = gl.reshape(v_scale_val, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
-        # v_scale_sum = gl.sum(v_scale_val, axis=0)
-        # v_scale_mean = v_scale_sum / float(MAX_NUM_KV_BLKS * KV_BLK_SZ)
-
-        if v.dtype.is_fp8():
-            # 0 for per_tensor quant
-            if KV_QUANT_MODE == 0:
-                v = v_scale * v.to(gl.float32)
-                v = v.to(v_cache_ptr.dtype.element_ty)
-            # 1 for per_token quant
-            elif KV_QUANT_MODE == 1:
-                v = v_scale_val * v.to(gl.float32)
-                v = v.to(v_cache_ptr.dtype.element_ty)
+        # if v.dtype.is_fp8():
+        #     # 0 for per_tensor quant
+        #     if KV_QUANT_MODE == 0:
+        #         v = v_scale * v.to(gl.float32)
+        #         v = v.to(v_cache_ptr.dtype.element_ty)
+        #     # 1 for per_token quant
+        #     elif KV_QUANT_MODE == 1:
+        #         v = v_scale_val * v.to(gl.float32)
+        #         v = v.to(v_cache_ptr.dtype.element_ty)
 
         if alibi_slopes is not None:
             qk += (alibi_slope[:, None] * (qk_col_offs - kv_seq_len + 1)[None, :]).to(gl.float32)
@@ -937,17 +935,25 @@ def pa_decode_v2_gluon_fp8(
         # if [0, SEQ_PARTITION_SZ) are all -inf, the result will be nan
         # so, we use -1e37 other than -inf
         # qk = tl.where(qk_bound_mask, qk, float("-inf"))
-        qk = tl.where(qk_bound_mask, qk, float(-1e37))
+        qk = tl.where(qk_bound_mask, qk, float(-1e38))
         curr_m = gl.max(qk, axis=1)
         m_i_new = gl.maximum(m_i, curr_m)
-        alpha = tl.math.exp2(m_i - m_i_new)
+        # acc_scale = tl.math.exp2(m_i - m_i_new)
+        acc_scale = tl.math.exp2((m_i - m_i_new) * log2e)
 
         # p[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
-        p = tl.math.exp2((qk - m_i_new[:, None]))
+        # p = tl.math.exp2((qk - m_i_new[:, None]))
+        p = tl.math.exp2((qk - m_i_new[:, None]) * log2e)
+        l_i = acc_scale * l_i + gl.sum(p, axis=1)
 
-        # l_i = gl.sum(p, axis=1)
-        # exp_sum = 1.0 / l_i
-        l_i = alpha * l_i + gl.sum(p, axis=1)
+        if v.dtype.is_fp8():
+            # 1 for per_token quant
+            if KV_QUANT_MODE == 1:
+                vs_max = gl.max(v_scale_val, axis=1)
+                vs_max_2d = vs_max[:, None]
+                v_scale_val = v_scale_val * float(240.0) / vs_max_2d
+                p = v_scale_val * p
+                p_scale = vs_max / float(240.0)
 
         if CONTIGUOUS_KV_ELEMS_16B_LOAD == 16:
             # kv element is 1 bytes(fp8)
@@ -964,10 +970,16 @@ def pa_decode_v2_gluon_fp8(
         pc = gl.convert_layout(p, layout=pv_lhs_layout)
         vc = gl.convert_layout(v, layout=pv_rhs_layout)
 
-        acc_scale = l_i * 0 + alpha  # Workaround some compiler bug
+        # acc_scale = l_i * 0 + alpha  # Workaround some compiler bug
         acc_scale = gl.convert_layout(acc_scale[:, None], layout=pv_mfma_layout)
+        p_scale = gl.convert_layout(p_scale[:, None], layout=pv_mfma_layout)
         acc0 = acc_scale * acc0
-        acc0 = gl.amd.cdna3.mfma(pc, vc, acc0)
+        # acc0 = gl.amd.cdna3.mfma(pc, vc, acc0)
+        # acc0 = p_scale * acc0
+        accumulator1 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
+        acc = gl.amd.cdna3.mfma(pc, vc, accumulator1)
+        acc0 += p_scale * acc
+
         m_i = m_i_new
 
 
@@ -1020,6 +1032,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     #TODO: Add Doc
     """
 
+    log2e: gl.constexpr = 1.4426950408889634
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
@@ -1052,6 +1065,8 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     # exp_sums: [MAX_NUM_SEQ_PARTITIONS, QUERY_GRP_SZ_POW2]
     exp_sums = tl.load(exp_sums_ptr + exp_sums_offs, mask=exp_sums_mask)
     exp_sums *= tl.exp(max_logits - ml[None, :])
+    # exp_sums *= tl.exp2(max_logits - ml[None, :])
+    # exp_sums *= tl.exp2((max_logits - ml[None, :]) * log2e)
 
     # exp_sum: [QUERY_GRP_SZ_POW2]
     exp_sum = tl.sum(exp_sums, axis=0)
