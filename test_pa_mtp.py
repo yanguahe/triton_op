@@ -23,6 +23,8 @@ from pa_decode_triton import paged_attention_decode as paged_attention_decode_tr
 # from pa_decode_triton_fp8 import paged_attention_decode as paged_attention_decode_triton_fp8
 from pa_decode_triton_fp8_2 import paged_attention_decode as paged_attention_decode_triton_fp8
 from pa_decode_triton_fp8_gluon import paged_attention_decode as paged_attention_decode_gluon_fp8
+from pa_decode_triton_fp8_gluon_kv_loop import paged_attention_decode as paged_attention_decode_gluon_fp8
+from pa_decode_triton_fp8_gluon_kv_loop_ps import paged_attention_decode as paged_attention_decode_gluon_fp8_ps
 import triton.language as tl
 
 
@@ -411,6 +413,55 @@ def run_triton_fp8(
     return output, result
 
 
+def run_gluon_fp8_ps(
+    output: torch.Tensor,       # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    query: torch.Tensor,        # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    key_cache: torch.Tensor,    # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    value_cache: torch.Tensor,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    seq_lens: torch.Tensor,     # [num_seqs]
+    block_tables: torch.Tensor, # [num_seqs, max_num_blks_per_seq]
+    work_meta_data: torch.Tensor,
+    work_info_set: torch.Tensor,
+    work_indptr: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    attn_scale: float,
+    max_seq_len: int,
+    compute_type,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    num_seq_partitions: int = 0,  # TODO use this below
+    alibi_slopes: torch.Tensor = None,
+    max_logits: torch.Tensor = None,
+    exp_sums: torch.Tensor = None,
+    tmp_output: torch.Tensor = None,
+) -> None:
+    result = paged_attention_decode_gluon_fp8_ps(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        seq_lens,
+        block_tables,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        attn_scale,
+        max_seq_len,
+        compute_type,
+        q_scale,
+        k_scale,
+        v_scale,
+        num_seq_partitions=0,
+        alibi_slopes=None,
+    )
+    return output, result
+
+
 def run_gluon_fp8(
     output: torch.Tensor,       # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
     query: torch.Tensor,        # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
@@ -694,6 +745,101 @@ def test_pa_mtp(
     print(f"out_ref_md5={out_ref_md5}")
     print(f"triton_fp8_output_md5={triton_fp8_output_md5}")
 
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens, dim=0)
+
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    import math
+
+    max_qo_tiles_per_batch = int(math.ceil(torch.max(seq_lens_qo).item() * head_size / 128))
+
+    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
+    work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
+    work_info_set = torch.empty(
+        [batch_size * max_qo_tiles_per_batch * cu_num, 8],
+        dtype=torch.int32,
+        device="cuda",
+    ).fill_(-1)
+    reduce_indptr = torch.empty(
+        [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
+    )
+    reduce_final_map = torch.empty(
+        [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
+    )
+    reduce_partial_map = torch.empty(
+        [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
+    )
+
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        8,
+        1,
+        True,
+        work_meta_data,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        kv_granularity=64,
+        max_seqlen_qo=qlen,
+        uni_seqlen_qo=qlen,
+        fast_mode=True,
+    )
+
+    # import pdb; pdb.set_trace()
+
+    # gluon_ps_fp8_output = torch.ones_like(out_ref_noquant)
+    # gluon_ps_fp8_output, us_triton = run_gluon_fp8_ps(
+    #     gluon_ps_fp8_output,
+    #     # query,
+    #     # k_cache,
+    #     # v_cache,
+    #     q_quant,
+    #     k_quant_,
+    #     v_quant_,
+    #
+    #     kv_indptr,
+    #     block_tables,
+    #     work_meta_data,
+    #     work_info_set,
+    #     work_indptr,
+    #     reduce_indptr,
+    #     reduce_final_map,
+    #     reduce_partial_map,
+    #     softmax_scale,
+    #     seq_lens.max().item(),
+    #     torch_to_tl_dtype[dtype],
+    #     q_scale=q_scale,
+    #     k_scale=k_scale_asm,
+    #     v_scale=v_scale_asm,
+    #     num_seq_partitions=0,
+    #     alibi_slopes=None,
+    # )
+    #
+    # # import pdb; pdb.set_trace()
+    #
+    # us_triton = us_triton['triton']
+    # err_triton_noquant = checkAllclose(
+    #     out_ref,
+    #     gluon_ps_fp8_output,
+    #     atol=fp8_diff_thr,
+    #     rtol=fp8_diff_thr,
+    #     msg=f"[torch vs gluon_ps_fp8][   Quant]: {us_triton:>8.2f} us......",
+    # )
+    # compare_arrays(gluon_ps_fp8_output.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    # ret["us_gluon_ps_fp8"] = us_triton
+    # ret["err_gluon_ps_fp8"] = err_triton_noquant
+    # out_ref_md5 = hashlib.md5(out_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    # gluon_ps_fp8_output_md5 = hashlib.md5(gluon_ps_fp8_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    # print(f"out_ref_md5={out_ref_md5}")
+    # print(f"gluon_ps_fp8_output_md5={gluon_ps_fp8_output_md5}")
+    # kt_us = us_triton
+    # bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant_.dtype.itemsize + 2 * qlen * num_query_heads * q_quant.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
+    # ret["gluon_ps_fp8_bandwith(TB/s)"] = bandwith
 
     gluon_fp8_output = torch.empty_like(out_ref_noquant)
     gluon_fp8_output, us_triton = run_gluon_fp8(
@@ -704,7 +850,6 @@ def test_pa_mtp(
         q_quant,
         k_quant_,
         v_quant_,
-
         seq_lens,
         block_tables,
         softmax_scale,
@@ -716,6 +861,7 @@ def test_pa_mtp(
         num_seq_partitions=0,
         alibi_slopes=None,
     )
+
     us_triton = us_triton['triton']
     err_triton_noquant = checkAllclose(
         out_ref,
@@ -809,7 +955,7 @@ l_qlen = [1, 2]
 l_ctx_len = [2048, 4096, 8192]
 # l_ctx_len = [8192, 8193, 32768, 32769]
 # l_batch_size = [128, 32]
-l_batch_size = [4, 32, 128]
+l_batch_size = [4, 32, 80, 128]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
