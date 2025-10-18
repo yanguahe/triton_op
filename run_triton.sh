@@ -59,7 +59,8 @@ function copy_recent_amdgcn_files() {
     # kernel_name=sparse_attn
     # kernel_name=pa_decode_v2_big_blk_fp8
     # kernel_name=pa_decode_v2_fp8
-    kernel_name=pa_decode_v2_gluon_fp8
+    # kernel_name=pa_decode_v2_gluon_fp8
+    kernel_name=pa_decode_v2_gluon_big_blk_fp8
 
     # file_filter="*.amdgcn"
     file_filter="*$kernel_name*"
@@ -145,9 +146,16 @@ function run_triton_op {
     # python ./test_pa_mtp.py -n 8,1 -c 4096 -b 32 --trans_v
 
 
-    python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
-    python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
-    python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
+    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
+
+    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16 --trans_v
+    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16 --trans_v
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16 --trans_v
+
+    python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 1024
+
     # python ./test_pa_mtp.py -n 8,1 -q 2 -c 4096 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 16,1 -q 2 -c 4096 -b 128 --block_size 16
 
@@ -159,24 +167,6 @@ function run_triton_op {
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 8192 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 1 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 64,1 -q 1 --block_size 16
-
-
-    # python ./test_pa_mtp.py -n 5,1 -q 1 -c 57 -b 128 --block_size 16 --trans_v
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 4097 -b 32 --block_size 16 --trans_v
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 4096 -b 32 --block_size 16 --trans_v
-
-    # python ./test_pa_mtp.py -n 5,1 -q 2 -c 57 -b 128 --block_size 16 --trans_v
-    # python ./test_pa_mtp.py -n 10,1 -q 2 -c 4097 -b 32 --block_size 16 --trans_v
-    # python ./test_pa_mtp.py -n 10,1 -q 2 -c 4096 -b 32 --block_size 16 --trans_v
-
-    # python ./test_pa_mtp.py -n 5,1 -q 1 -c 57 -b 128 --block_size 1024 --trans_v
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 4097 -b 32 --block_size 1024 --trans_v
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 4096 -b 32 --block_size 1024 --trans_v
-
-    # python ./test_pa_mtp.py -n 5,1 -q 2 -c 57 -b 128 --block_size 1024 --trans_v
-    # python ./test_pa_mtp.py -n 10,1 -q 2 -c 4097 -b 32 --block_size 1024 --trans_v
-    # python ./test_pa_mtp.py -n 10,1 -q 2 -c 4096 -b 32 --block_size 1024 --trans_v
-
 
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 7 -b 32
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 256 -b 32
@@ -221,7 +211,8 @@ function get_triton_pa_thread_trace {
     # KERNEL=matmul_ori_kernel_v2
     # KERNEL=_triton_mixed_sparse_attn_fwd_kernel_v1
     # KERNEL=_triton_block_sparse_attn_fwd_kernel_v1
-    KERNEL=pa_decode_v2_gluon_fp8
+    # KERNEL=pa_decode_v2_gluon_fp8
+    KERNEL=pa_decode_v2_gluon_big_blk_fp8
     # KERNEL=pa_bf16_pertokenFp8_gqa8_2tg_4w_uhp
     # KERNEL=matmul_kernel
     # KERNEL=_fwd_grouped_kernel_stage1_rope
@@ -251,7 +242,9 @@ function get_triton_pa_thread_trace {
         mkdir -p ${trace_dir}
 
         rocprofv2 -d ${trace_dir} -i ./thread_trace/att.txt --plugin att auto --mode file,csv -o ${trace_dir}/csv_${KERNEL_VERSION} \
-        python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
+        python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 1024
+        # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
+        # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
         # python ./block_sparse_attn.py
         # python ./mixed_sparse_attn.py
         # python ./00-gemm.py
@@ -265,6 +258,7 @@ function get_triton_pa_thread_trace {
         cd -
     fi
 
+    copy_recent_amdgcn_files
     popd
 }
 

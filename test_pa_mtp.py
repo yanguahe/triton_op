@@ -737,31 +737,31 @@ def test_pa_mtp(
     ret["gluon_fp8_bandwith(TB/s)"] = bandwith
 
 
-    out_aiter_asm, us_aiter_asm = run_aiter_asm(
-        query,
-        k_quant_,
-        v_quant_,
-        block_tables,
-        seq_lens,
-        block_tables.size(1),
-        max_qlen,
-        k_scale_asm,
-        v_scale_asm,
-        qo_indptr,
-    )
-    err = checkAllclose(
-        out_ref,
-        out_aiter_asm,
-        atol=fp8_diff_thr,
-        rtol=fp8_diff_thr,
-        msg=f"[torch vs aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
-    )
-    compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
-    ret["us_asm_fp8"] = us_aiter_asm
-    ret["err fp8"] = err
-    kt_us = us_aiter_asm
-    bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant_.dtype.itemsize + 2 * qlen * num_query_heads * query.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
-    ret["asm_fp8_bandwith(TB/s)"] = bandwith
+    # out_aiter_asm, us_aiter_asm = run_aiter_asm(
+    #     query,
+    #     k_quant_,
+    #     v_quant_,
+    #     block_tables,
+    #     seq_lens,
+    #     block_tables.size(1),
+    #     max_qlen,
+    #     k_scale_asm,
+    #     v_scale_asm,
+    #     qo_indptr,
+    # )
+    # err = checkAllclose(
+    #     out_ref,
+    #     out_aiter_asm,
+    #     atol=fp8_diff_thr,
+    #     rtol=fp8_diff_thr,
+    #     msg=f"[torch vs aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
+    # )
+    # compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    # ret["us_asm_fp8"] = us_aiter_asm
+    # ret["err fp8"] = err
+    # kt_us = us_aiter_asm
+    # bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant_.dtype.itemsize + 2 * qlen * num_query_heads * query.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
+    # ret["asm_fp8_bandwith(TB/s)"] = bandwith
 
 
     # q_scale = q_scale.squeeze(-1)
