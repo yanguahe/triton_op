@@ -105,13 +105,6 @@ def pa_decode_v2_gluon_big_blk_fp8(
         order           =[1, 0],
     )
 
-    page_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread =[1, 1, 1, 16],
-        threads_per_warp=[1, 4, 16, 1],
-        warps_per_cta   =[4, 1, 1, 1],
-        order           =[3, 2, 1, 0],
-    )
-
     # MAX_NUM_KV_BLKS x K_HEAD_SZ_POW2_SPLIT x KV_BLK_SZ_POW2 x CONTIGUOUS_KV_ELEMS_16B_LOAD
     # 16 x 16 x 16 x 8 x fp16
     blocked_k1: gl.constexpr = gl.DistributedLinearLayout( # fp16
@@ -136,12 +129,6 @@ def pa_decode_v2_gluon_big_blk_fp8(
         warps_per_cta   =[1, 4, 1],
         order           =[2, 1, 0],
     )
-    # blocked_k2: gl.constexpr = gl.BlockedLayout(
-    #     size_per_thread =[1, 1, 1, 16],
-    #     threads_per_warp=[1, 4, 16, 1],
-    #     warps_per_cta   =[4, 1, 1, 1],
-    #     order           =[3, 2, 1, 0],
-    # )
     blocked_k: gl.constexpr = blocked_k1 if CONTIGUOUS_KV_ELEMS_16B_LOAD == 8 else blocked_k2
 
     # transposed: indicates the result tensor is transposed so that each thread holds consecutive elements
@@ -155,13 +142,6 @@ def pa_decode_v2_gluon_big_blk_fp8(
     qk_rhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=qk_mfma_layout, k_width=16
     )
-    # qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
-    #     reg_bases=((0,1), (0,2), (0,4), (0,128)), # 16 x 8
-    #     lane_bases=((1,0), (2,0), (4,0), (8,0), (0,8), (0,16)), # 64
-    #     warp_bases=((0,32), (0,64)), # 4
-    #     block_bases=[], # 8
-    #     shape=[16, KV_COMPUTE_BLOCK_SIZE],
-    # )
     if KV_COMPUTE_BLOCK_SIZE == 128:
         qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=((0,1), (0,2), (0,64)),
@@ -210,17 +190,6 @@ def pa_decode_v2_gluon_big_blk_fp8(
         v_dim0_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(1, blocked_v_layout))
         v_dim1_offs = gl.arange(0, KV_COMPUTE_BLOCK_SIZE, layout=gl.SliceLayout(0, blocked_v_layout))
 
-        # # [MAX_NUM_KV_BLKS, 128, 16]
-        # blocked_v_layout: gl.constexpr = gl.BlockedLayout(
-        #     size_per_thread =[1, 1, 16],
-        #     threads_per_warp=[4, 16, 1],
-        #     warps_per_cta   =[1, 4, 1],
-        #     order           =[2, 1, 0],
-        # )
-        # v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
-        # v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout)))
-        # v_dim2_offs = gl.arange(0, SUB_KV_BLK_SZ, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_v_layout)))
-
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
     )
@@ -243,27 +212,13 @@ def pa_decode_v2_gluon_big_blk_fp8(
     # blocked_k dim2
     contiguous_kv_elems_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, blocked_k))
 
-    # # blocked_k dim0
-    # blk_id_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k)))
-    # # blocked_k dim1
-    # head_sz_div_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k)))
-    # # blocked_k dim2
-    # blk_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, blocked_k)))
-    # # blocked_k dim3
-    # contiguous_kv_elems_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, blocked_k)))
-
     q_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=query_grp_sz_layout)
     head_sz_offs = gl.arange(0, HEAD_SZ_POW2, layout=head_sz_layout)
 
-    # kv_page_id_offs = gl.full([1], 0, gl.int32)
-    # kv_page_id_offs = gl.full([1], 0, gl.int32, layout=gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k))))
-    kv_page_id_offs = gl.full([1], 0, gl.int32, layout=gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, page_layout))))
     kv_scale_col_offs = gl.arange(0, KV_COMPUTE_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout))
 
-    # sub_blk_id_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=blk_id_layout)
     head_sz_div_offs = gl.arange(0, K_HEAD_SZ_POW2_SPLIT, layout=head_sz_div_layout)
     blk_offs = gl.arange(0, KV_COMPUTE_BLOCK_SIZE, layout=blk_layout)
-    # blk_offs = gl.arange(0, SUB_KV_BLK_SZ, layout=blk_layout)
     contiguous_kv_elems_offs = gl.arange(0, CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=contiguous_kv_elems_layout)
 
     qk_row_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_linear_layout))
@@ -357,15 +312,11 @@ def pa_decode_v2_gluon_big_blk_fp8(
     if kv_seq_start_idx >= kv_seq_len:
         return
     KV_COMPUTE_BLOCK_NUM: gl.constexpr = SEQ_PARTITION_SZ // KV_COMPUTE_BLOCK_SIZE
-    # seq_end_idx = gl.minimum(kv_seq_start_idx + SEQ_PARTITION_SZ, kv_seq_len)
-    # SEQ_PARTITION_NUM_KV_BLKS: gl.constexpr = SEQ_PARTITION_SZ // KV_BLK_SZ
 
     for kv_idx in range(KV_COMPUTE_BLOCK_NUM):
         kv_sub_seq_start_idx = kv_seq_start_idx + kv_idx * KV_COMPUTE_BLOCK_SIZE
-        kv_sub_seq_end_idx = gl.minimum(kv_sub_seq_start_idx + KV_COMPUTE_BLOCK_SIZE, kv_seq_len)
         blk_tb_id = kv_sub_seq_start_idx // KV_BLK_SZ
 
-        # num_kv_blks = gl.cdiv(kv_sub_seq_end_idx - kv_sub_seq_start_idx, KV_BLK_SZ)
         qk_col_offs = kv_sub_seq_start_idx + gl.arange(0, KV_COMPUTE_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout))
 
         # load alibi slopes[QUERY_GRP_SZ_POW2]
@@ -375,18 +326,11 @@ def pa_decode_v2_gluon_big_blk_fp8(
             alibi_slope = gl.amd.cdna3.buffer_load(ptr=alibi_slopes + kv_head_idx * QUERY_GRP_SZ, offsets=qk_row_offs, mask=qk_row_offs < QUERY_GRP_SZ)
 
         blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
-        # k_page_id = gl.amd.cdna3.buffer_load(blk_tables_start_ptr + blk_tb_id, offsets=kv_page_id_offs)
-        # k_page_id = gl.convert_layout(k_page_id, layout=blk_layout)
         k_page_id = tl.load(blk_tables_start_ptr + blk_tb_id)
-        # k_page_id = sub_blk_id_offs * 0
-        # k_page_id1 = gl.amd.cdna3.buffer_load(blk_tables_start_ptr + blk_tb_id, offsets=gl.arange(0, 1))
-        # k_page_id2 = tl.load(blk_tables_start_ptr + blk_tb_id)
-        # tl.static_print(k_page_id1.type)
-        # tl.static_print(k_page_id2.type)
+        # tl.static_print(k_page_id.type)
 
         # k_blk_offs[K_HEAD_SZ_POW2_SPLIT, KV_COMPUTE_BLOCK_SIZE, CONTIGUOUS_KV_ELEMS_16B_LOAD]
         k_blk_offs = (
-            # k_page_id[None, :, None] * stride_k_b
             k_page_id * stride_k_b
             + kv_head_idx * stride_k_nh
             + head_sz_div_offs[:, None, None] * stride_k_hz
@@ -399,18 +343,13 @@ def pa_decode_v2_gluon_big_blk_fp8(
                 k_temp = softmax_scale * k_scale * k_temp.to(gl.float32)
                 k_temp = k_temp.to(k_cache_ptr.dtype.element_ty)
             elif KV_QUANT_MODE == 1:
-                # [1, KV_COMPUTE_BLOCK_SIZE, 1]
-                # kv_scale_page_id = gl.convert_layout(k_page_id, layout=gl.SliceLayout(0, qk_linear_layout))
-                # k_scale_offs = kv_scale_page_id * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + page_offset + kv_scale_col_offs
+                # [KV_COMPUTE_BLOCK_SIZE]
                 k_scale_offs = k_page_id * kv_scale_stride0 + kv_head_idx * kv_scale_stride1 + page_offset + kv_scale_col_offs
                 k_scale_val_temp = gl.amd.cdna3.buffer_load(ptr=k_scale, offsets=k_scale_offs)
-                # [KV_COMPUTE_BLOCK_SIZE]
                 v_scale_val = gl.amd.cdna3.buffer_load(ptr=v_scale, offsets=k_scale_offs)
 
         kt_temp = gl.permute(k_temp, [0, 2, 1])
         kt_temp = gl.reshape(kt_temp, [HEAD_SZ_POW2, KV_COMPUTE_BLOCK_SIZE])
-        # kt_temp = gl.permute(k_temp, [1, 3, 0, 2])
-        # kt_temp = gl.reshape(kt_temp, [HEAD_SZ_POW2, KV_COMPUTE_BLOCK_SIZE])
 
         if TRANS_V:
             kv_blk_nums2 = gl.convert_layout(kv_blk_nums, layout=gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_v_layout))))
@@ -428,7 +367,6 @@ def pa_decode_v2_gluon_big_blk_fp8(
             v = gl.permute(v, [0, 1, 3, 2])
             v = gl.reshape(v, [KV_COMPUTE_BLOCK_SIZE, HEAD_SZ_POW2])
         else:
-            # v_page_id = gl.convert_layout(k_page_id, layout=gl.SliceLayout(0, blocked_v_layout))
             # v_blk_offs[HEAD_SZ_POW2, KV_COMPUTE_BLOCK_SIZE]
             v_blk_offs = (
                 # v_page_id[None, :] * stride_v_b
