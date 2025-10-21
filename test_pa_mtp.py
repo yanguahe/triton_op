@@ -319,7 +319,7 @@ def run_aiter_hip(
         None,
         k_scale,
         v_scale,
-        q_scale=q_scale,
+        # q_scale=q_scale,
         mtp=max_qlen,
     )
 
@@ -552,7 +552,7 @@ def test_pa_mtp(
     )
     compare_arrays(out_hip_noquant.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
     ret["us_hip_bf16"] = us_hip
-    ret["err_hip_bf16"] = err_hip_noquant
+    # ret["err_hip_bf16"] = err_hip_noquant
 
 
     # triton_output = torch.empty_like(out_ref_noquant)
@@ -647,6 +647,7 @@ def test_pa_mtp(
     # v_scale_asm[...] = v_scale_asm1.reshape(-1)[0]
     # query = q_scale * q_quant.to(torch.float32)
     # query = query.to(dtype)
+
     # quant version torch ref
     out_ref = torch_mha_extend(
         query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
@@ -689,7 +690,7 @@ def test_pa_mtp(
     compare_arrays(triton_fp8_output.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
     # compare_arrays(triton_fp8_output.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
     ret["us_triton_fp8"] = us_triton
-    ret["err_triton_fp8"] = err_triton_noquant
+    # ret["err_triton_fp8"] = err_triton_noquant
     out_ref_md5 = hashlib.md5(out_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
     triton_fp8_output_md5 = hashlib.md5(triton_fp8_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
     print(f"out_ref_md5={out_ref_md5}")
@@ -714,6 +715,9 @@ def test_pa_mtp(
         q_scale=q_scale,
         k_scale=k_scale_asm,
         v_scale=v_scale_asm,
+        # q_scale=q_scale.reshape(-1)[0],
+        # k_scale=k_scale_asm.reshape(-1)[0],
+        # v_scale=v_scale_asm.reshape(-1)[0],
         num_seq_partitions=0,
         alibi_slopes=None,
     )
@@ -737,58 +741,62 @@ def test_pa_mtp(
     ret["gluon_fp8_bandwith(TB/s)"] = bandwith
 
 
-    # out_aiter_asm, us_aiter_asm = run_aiter_asm(
-    #     query,
-    #     k_quant_,
-    #     v_quant_,
-    #     block_tables,
-    #     seq_lens,
-    #     block_tables.size(1),
-    #     max_qlen,
-    #     k_scale_asm,
-    #     v_scale_asm,
-    #     qo_indptr,
-    # )
-    # err = checkAllclose(
-    #     out_ref,
-    #     out_aiter_asm,
-    #     atol=fp8_diff_thr,
-    #     rtol=fp8_diff_thr,
-    #     msg=f"[torch vs aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
-    # )
-    # compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
-    # ret["us_asm_fp8"] = us_aiter_asm
-    # ret["err fp8"] = err
-    # kt_us = us_aiter_asm
-    # bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant_.dtype.itemsize + 2 * qlen * num_query_heads * query.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
-    # ret["asm_fp8_bandwith(TB/s)"] = bandwith
+    if block_size == 16:
+        out_aiter_asm, us_aiter_asm = run_aiter_asm(
+            query,
+            k_quant_,
+            v_quant_,
+            block_tables,
+            seq_lens,
+            block_tables.size(1),
+            max_qlen,
+            k_scale_asm,
+            v_scale_asm,
+            # k_scale_asm.reshape(-1)[0],
+            # v_scale_asm.reshape(-1)[0],
+            qo_indptr,
+        )
+        err = checkAllclose(
+            out_ref,
+            out_aiter_asm,
+            atol=fp8_diff_thr,
+            rtol=fp8_diff_thr,
+            msg=f"[torch vs aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
+        )
+        compare_arrays(out_aiter_asm.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+        ret["us_asm_fp8"] = us_aiter_asm
+        # ret["err fp8"] = err
+        kt_us = us_aiter_asm
+        bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant_.dtype.itemsize + 2 * qlen * num_query_heads * query.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
+        ret["asm_fp8_bandwith(TB/s)"] = bandwith
 
 
-    # q_scale = q_scale.squeeze(-1)
-    # out_hip, us_hip = run_aiter_hip(
-    #     q_quant.to(torch.bfloat16),
-    #     k_quant_,
-    #     v_quant_,
-    #     block_tables,
-    #     seq_lens,
-    #     ctx_lens,
-    #     max_qlen,
-    #     "fp8",
-    #     num_kv_heads,
-    #     softmax_scale,
-    #     k_scale_asm,
-    #     v_scale_asm,
-    #     q_scale,
-    # )
-    # err = checkAllclose(
-    #     out_ref,
-    #     out_hip,
-    #     atol=fp8_diff_thr,
-    #     rtol=fp8_diff_thr,
-    #     msg=f"[torch vs aiter_hip_fp8][   Quant]: {us_hip:>8.2f} us......",
-    # )
-    # compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
-    # ret["us_hip_fp8"] = us_hip
+    q_scale = q_scale.squeeze(-1)
+    out_hip, us_hip = run_aiter_hip(
+        # q_quant.to(torch.bfloat16),
+        query,
+        k_quant_,
+        v_quant_,
+        block_tables,
+        seq_lens,
+        ctx_lens,
+        max_qlen,
+        "fp8",
+        num_kv_heads,
+        softmax_scale,
+        k_scale_asm,
+        v_scale_asm,
+        q_scale,
+    )
+    err = checkAllclose(
+        out_ref,
+        out_hip,
+        atol=fp8_diff_thr,
+        rtol=fp8_diff_thr,
+        msg=f"[torch vs aiter_hip_fp8][   Quant]: {us_hip:>8.2f} us......",
+    )
+    compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    ret["us_hip_fp8"] = us_hip
     # ret["err_hip_fp8"] = err
 
 
@@ -799,15 +807,15 @@ def test_pa_mtp(
 
 
 head_dim = 128
-# block_size_list = [16, 128, 256, 512, 1024]
-block_size_list = [16, 64, 1024]
+block_size_list = [16, 64, 128, 256, 512, 1024]
+# block_size_list = [16, 64, 1024]
 l_dtype = ["bf16"]
 # l_num_heads = [(5, 1), (8, 1), (10, 1)]
 l_num_heads = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 1), (8, 2)]
 l_qlen = [1, 2]
 # l_qlen = [1, 2, 3, 4]
-# l_ctx_len = [7, 26, 57, 66, 109, 128, 256, 257, 282, 512, 513, 4096, 4097]
-l_ctx_len = [2048, 4096, 8192]
+l_ctx_len = [7, 26, 57, 66, 109, 128, 256, 257, 282, 512, 513, 4096, 4097]
+# l_ctx_len = [2048, 4096, 8192]
 # l_ctx_len = [8192, 8193, 32768, 32769]
 # l_batch_size = [128, 32]
 l_batch_size = [4, 32, 80, 128]

@@ -62,11 +62,11 @@ function copy_recent_amdgcn_files() {
     # kernel_name=pa_decode_v2_gluon_fp8
     kernel_name=pa_decode_v2_gluon_big_blk_fp8
 
-    # file_filter="*.amdgcn"
     file_filter="*$kernel_name*"
 
     ll ~/.triton/cache/*/$file_filter
-    cp ~/.triton/cache/*/$file_filter $dest_dir
+    # cp ~/.triton/cache/*/$file_filter $dest_dir
+    # ll $dest_dir
 
     # if [[ -z "$k" || -z "$dest_dir" ]]; then
     #     echo "Usage: copy_recent_amdgcn_files <number_of_files> <destination_directory>"
@@ -96,7 +96,9 @@ function copy_recent_amdgcn_files() {
     #     ll $file
     #     cp "$file" "$dest_dir/"
     # done
-    ll $dest_dir
+
+    amdgcn_filter=~/.triton/cache/*/*$kernel_name*.amdgcn
+    cat $amdgcn_filter | egrep ".sgpr_count|.sgpr_spill_count|.vgpr_count|.vgpr_spill_count"
 }
 
 
@@ -148,13 +150,19 @@ function run_triton_op {
 
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
-    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
+    python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4097 -b 128 --block_size 16
 
-    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16 --trans_v
-    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16 --trans_v
+    # # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16 --trans_v
+    # # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16 --trans_v
     # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16 --trans_v
 
-    python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 1024
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 1024
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 1024 --trans_v
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4097 -b 128 --block_size 1024
+
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 64
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 64 --trans_v
 
     # python ./test_pa_mtp.py -n 8,1 -q 2 -c 4096 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 16,1 -q 2 -c 4096 -b 128 --block_size 16
