@@ -943,6 +943,130 @@ def pa_decode_v2_gluon_fp8(
     gl.amd.cdna3.buffer_store(stored_value=acc0, ptr=logits_ptr, offsets=logits_offs, mask=o_mask)
 
 
+@gluon.jit
+def paged_attn_decode_v2_reduce_gluon(
+    out_ptr,        # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
+    exp_sums_ptr,   # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    max_logits_ptr, # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    logits_ptrs,    # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+    seq_lens_ptr,   # [num_seqs]
+    sink_ptr,       # [num_query_heads]
+    stride_o_s,
+    stride_o_h,
+    stride_exp_sums_s,
+    stride_exp_sums_h,
+    stride_exp_sums_p,
+    stride_logits_s,
+    stride_logits_h,
+    stride_logits_p,
+    stride_logits_g,
+    HEAD_SZ: tl.constexpr,
+    HEAD_SZ_POW2: tl.constexpr,
+    QUERY_GRP_SZ: tl.constexpr,
+    QUERY_GRP_SZ_POW2: tl.constexpr,
+    SEQ_PARTITION_SZ: tl.constexpr,
+    MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
+    MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr,
+    USE_SINKS: tl.constexpr
+):
+    seq_idx = gl.program_id(0)
+    kv_head_idx = gl.program_id(1)
+    num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
+    seq_len = gl.load(seq_lens_ptr + seq_idx)
+    num_partitions = gl.cdiv(seq_len, SEQ_PARTITION_SZ)
+    if MAX_NUM_SEQ_PARTITIONS_POW2 >= 256:
+        blocked_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread =[1, 2, 4],
+            threads_per_warp=[4, 4, 4],
+            warps_per_cta   =[4, 1, 1],
+            order           =[2, 1, 0],
+        )
+    else:
+        blocked_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread =[4, 1, 2],
+            threads_per_warp=[4, 4, 4],
+            warps_per_cta   =[1, 1, 4],
+            order           =[2, 1, 0],
+        )
+    query_grp_sz_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, blocked_layout))
+    head_sz_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, blocked_layout))
+    seq_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, blocked_layout))
+
+    part_offs = gl.arange(0, MAX_NUM_SEQ_PARTITIONS_POW2, layout=seq_layout)
+    q_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=query_grp_sz_layout)
+    head_offs = gl.arange(0, HEAD_SZ_POW2, layout=head_sz_layout)
+
+    # get global max logit
+    exp_sums_offs = (
+        seq_idx * stride_exp_sums_s
+        + kv_head_idx * stride_exp_sums_h
+        + part_offs[:, None] * stride_exp_sums_p
+        + q_grp_offs[None, :]
+    )
+    exp_sums_mask = (part_offs[:, None] < num_partitions) & (
+        q_grp_offs[None, :] < QUERY_GRP_SZ
+    )
+
+    # max_logits: [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2]
+    max_logits = gl.amd.cdna3.buffer_load(
+        # ptr=max_logits_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=float("-inf")
+        ptr=max_logits_ptr, offsets=exp_sums_offs, mask=exp_sums_mask
+    )
+    # max_logit: [QUERY_GRP_SZ_POW2]
+    ml = tl.max(max_logits, axis=0)
+
+    # Rescale the exp sums and compute the global sum
+    # exp_sums: [MAX_NUM_SEQ_PARTITIONS, QUERY_GRP_SZ_POW2]
+    # exp_sums = gl.amd.cdna3.buffer_load(ptr=exp_sums_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=0.0)
+    exp_sums = gl.amd.cdna3.buffer_load(ptr=exp_sums_ptr, offsets=exp_sums_offs, mask=exp_sums_mask)
+    exp_sums *= tl.exp(max_logits - ml[None, :])
+
+    # exp_sum: [QUERY_GRP_SZ_POW2]
+    exp_sum = tl.sum(exp_sums, axis=0)
+    if USE_SINKS:
+        M = gl.load(
+            sink_ptr + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs),
+            mask=(kv_head_idx * QUERY_GRP_SZ + q_grp_offs) < num_query_heads,
+        )
+        exp_sum += tl.math.exp(M - ml)
+    # p: [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2]
+    p = exp_sums / exp_sum[None, :]
+    p = tl.reshape(p, (MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2, 1))
+
+    # logits_offset
+    logits_offset = (
+        seq_idx * stride_logits_s
+        + kv_head_idx * stride_logits_h
+        + part_offs[:, None, None] * stride_logits_p
+        + q_grp_offs[None, :, None] * stride_logits_g
+        + head_offs[None, None, :]
+    )
+    # load logits
+    logits_mask = (part_offs[:, None] < num_partitions) & (
+        q_grp_offs[None, :] < QUERY_GRP_SZ
+    )
+    logits = gl.amd.cdna3.buffer_load(
+        # ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None], other=0.0
+        ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None]
+    )
+
+    # out: [QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
+    out = tl.sum((logits * gl.convert_layout(p, layout=blocked_layout)).to(tl.float32), axis=0, keep_dims=True).to(out_ptr.dtype.element_ty)
+    # store output
+    out_offs = (
+        seq_idx * stride_o_s
+        + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[None, :, None]) * stride_o_h
+        + head_offs[None, None, :]
+    )
+    # gl.static_print(out_offs)
+    gl.amd.cdna3.buffer_store(
+        stored_value=out,
+        ptr=out_ptr,
+        offsets=out_offs,
+        mask=(q_grp_offs[None, :, None] < QUERY_GRP_SZ) & (head_offs[None, None, :] < HEAD_SZ),
+    )
+
+
 @triton.jit
 def _paged_attn_decode_v2_w_dot_reduce_kernel(
     out_ptr,        # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
@@ -1266,29 +1390,58 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
     MAX_NUM_SEQ_PARTITIONS,
     MAX_NUM_SEQ_PARTITIONS_POW2,
 ):
-    _paged_attn_decode_v2_w_dot_reduce_kernel[grid](
-        out_ptr,        # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
-        exp_sums_ptr,   # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-        max_logits_ptr, # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-        logits_ptrs,    # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-        seq_lens_ptr,   # [num_seqs]
-        stride_o_s,
-        stride_o_h,
-        stride_exp_sums_s,
-        stride_exp_sums_h,
-        stride_exp_sums_p,
-        stride_logits_s,
-        stride_logits_h,
-        stride_logits_p,
-        stride_logits_g,
-        HEAD_SZ=HEAD_SZ,
-        HEAD_SZ_POW2=HEAD_SZ_POW2,
-        QUERY_GRP_SZ=QUERY_GRP_SZ,
-        QUERY_GRP_SZ_POW2=QUERY_GRP_SZ_POW2,
-        SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
-        MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
-        MAX_NUM_SEQ_PARTITIONS_POW2=MAX_NUM_SEQ_PARTITIONS_POW2,
-    )
+    # REDUCE_USE_GLUON = True
+    REDUCE_USE_GLUON = False
+    if REDUCE_USE_GLUON:
+        paged_attn_decode_v2_reduce_gluon[grid](
+            out_ptr,        # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
+            exp_sums_ptr,   # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+            max_logits_ptr, # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+            logits_ptrs,    # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+            seq_lens_ptr,   # [num_seqs]
+            None,
+            stride_o_s,
+            stride_o_h,
+            stride_exp_sums_s,
+            stride_exp_sums_h,
+            stride_exp_sums_p,
+            stride_logits_s,
+            stride_logits_h,
+            stride_logits_p,
+            stride_logits_g,
+            HEAD_SZ=HEAD_SZ,
+            HEAD_SZ_POW2=HEAD_SZ_POW2,
+            QUERY_GRP_SZ=QUERY_GRP_SZ,
+            QUERY_GRP_SZ_POW2=QUERY_GRP_SZ_POW2,
+            SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
+            MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
+            MAX_NUM_SEQ_PARTITIONS_POW2=MAX_NUM_SEQ_PARTITIONS_POW2,
+            USE_SINKS=False,
+        )
+    else:
+        _paged_attn_decode_v2_w_dot_reduce_kernel[grid](
+            out_ptr,        # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
+            exp_sums_ptr,   # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+            max_logits_ptr, # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+            logits_ptrs,    # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+            seq_lens_ptr,   # [num_seqs]
+            stride_o_s,
+            stride_o_h,
+            stride_exp_sums_s,
+            stride_exp_sums_h,
+            stride_exp_sums_p,
+            stride_logits_s,
+            stride_logits_h,
+            stride_logits_p,
+            stride_logits_g,
+            HEAD_SZ=HEAD_SZ,
+            HEAD_SZ_POW2=HEAD_SZ_POW2,
+            QUERY_GRP_SZ=QUERY_GRP_SZ,
+            QUERY_GRP_SZ_POW2=QUERY_GRP_SZ_POW2,
+            SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
+            MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
+            MAX_NUM_SEQ_PARTITIONS_POW2=MAX_NUM_SEQ_PARTITIONS_POW2,
+        )
 
 
 def paged_attention_decode(
