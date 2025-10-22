@@ -60,7 +60,8 @@ function copy_recent_amdgcn_files() {
     # kernel_name=pa_decode_v2_big_blk_fp8
     # kernel_name=pa_decode_v2_fp8
     # kernel_name=pa_decode_v2_gluon_fp8
-    kernel_name=pa_decode_v2_gluon_big_blk_fp8
+    # kernel_name=pa_decode_v2_gluon_big_blk_fp8
+    kernel_name=pa_decode_v2_gluon_
 
     file_filter="*$kernel_name*"
 
@@ -97,7 +98,9 @@ function copy_recent_amdgcn_files() {
     #     cp "$file" "$dest_dir/"
     # done
 
-    amdgcn_filter=~/.triton/cache/*/*$kernel_name*.amdgcn
+    amdgcn_filter=~/.triton/cache/*/$kernel_name*.amdgcn
+    json_filter=~/.triton/cache/*/$kernel_name*.json
+    cat $json_filter
     cat $amdgcn_filter | egrep ".sgpr_count|.sgpr_spill_count|.vgpr_count|.vgpr_spill_count"
 }
 
@@ -124,63 +127,32 @@ function run_triton_op {
     # python ./test_gluon_pa_qk_v2.py
     # python ./test_pa_decode_gluon_triton.py
 
-    # python ./test_pa_mtp.py -n 10,1 -q 2 -c 7 -b 32
-    # python ./test_pa_mtp.py -n 8,2 -q 2 -c 57 -b 128 --block_size 1024 --trans_v
 
-    # python ./test_pa_mtp.py -q 1 --block_size 16
-    # python ./test_pa_mtp.py -q 1 --block_size 16 --trans_v
-    # python ./test_pa_mtp.py -q 2 --block_size 16
-    # python ./test_pa_mtp.py -q 2 --block_size 16 --trans_v
+    python ./test_pa_mtp.py
+    python ./test_pa_mtp.py --trans_v
 
-    # python ./test_pa_mtp.py -q 1 --block_size 1024
-    # python ./test_pa_mtp.py -q 1 --block_size 1024 --trans_v
-    # python ./test_pa_mtp.py -q 2 --block_size 1024
-    # python ./test_pa_mtp.py -q 2 --block_size 1024 --trans_v
-
-
-    # python ./test_pa_mtp.py -n 10,1 -c 4097 -b 32
-    # python ./test_pa_mtp.py -n 10,1 -c 4096 -b 32
-    # python ./test_pa_mtp.py -n 8,1 -c 4097 -b 32
-    # python ./test_pa_mtp.py -n 8,1 -c 4096 -b 32
-    # python ./test_pa_mtp.py -n 10,1 -c 4097 -b 32 --trans_v
-    # python ./test_pa_mtp.py -n 10,1 -c 4096 -b 32 --trans_v
-    # python ./test_pa_mtp.py -n 8,1 -c 4097 -b 32 --trans_v
-    # python ./test_pa_mtp.py -n 8,1 -c 4096 -b 32 --trans_v
-
+    # python ./test_pa_mtp.py -n 5,1 -q 3 -c 512 -b 4 --block_size 16
 
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
-    python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
-    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4097 -b 128 --block_size 16
-
-    # # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16 --trans_v
-    # # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16 --trans_v
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16 --trans_v
-
     # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 1024
     # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 1024 --trans_v
-    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4097 -b 128 --block_size 1024
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4097 -b 128 --block_size 16
+
+    # python ./test_pa_mtp.py -n 10,1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 8,1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 8,1 -c 4096 -b 128 --block_size 1024
+    # python ./test_pa_mtp.py -n 16,1 -c 4096 -b 128 --block_size 1024
+    # python ./test_pa_mtp.py -n 8,1 -c 4096 -b 128 --block_size 1024 --trans_v
 
     # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 64
     # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 64 --trans_v
 
-    # python ./test_pa_mtp.py -n 8,1 -q 2 -c 4096 -b 128 --block_size 16
-    # python ./test_pa_mtp.py -n 16,1 -q 2 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 64,4 -q 1 -c 4096 -b 32 --block_size 16
 
-    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
-    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 1024
-    # python ./test_pa_mtp.py -n 8,1 -q 2 -c 4096 -b 32 --block_size 16
-    # python ./test_pa_mtp.py -n 16,1 -q 2 -c 4096 -b 32 --block_size 16
-
-    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 8192 -b 128 --block_size 16
-    # python ./test_pa_mtp.py -n 8,1 -q 1 -b 128 --block_size 16
-    # python ./test_pa_mtp.py -n 64,1 -q 1 --block_size 16
-
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 7 -b 32
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 256 -b 32
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 257 -b 32
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 512 -b 32
-    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 513 -b 32
 
     # rocprofv3 -i ./counters.yaml --kernel-include-regex "pa_decode_v2_fp8" --output-directory ./rocprofv3_out -- python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
     # rocprofv3 -i ./counters.yaml --kernel-include-regex "_paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk" --output-directory ./rocprofv3_out -- python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16

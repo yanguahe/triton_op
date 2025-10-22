@@ -658,43 +658,45 @@ def test_pa_mtp(
         print(f"trans v_quant_.shape={v_quant_.shape}")
     fp8_diff_thr = 5e-2
 
-    triton_fp8_output = torch.empty_like(out_ref_noquant)
-    triton_fp8_output, us_triton = run_triton_fp8(
-        triton_fp8_output,
-        # query,
-        # k_cache,
-        # v_cache,
-        q_quant,
-        k_quant_,
-        v_quant_,
 
-        seq_lens,
-        block_tables,
-        softmax_scale,
-        seq_lens.max().item(),
-        torch_to_tl_dtype[dtype],
-        q_scale=q_scale,
-        k_scale=k_scale_asm,
-        v_scale=v_scale_asm,
-        num_seq_partitions=0,
-        alibi_slopes=None,
-    )
-    us_triton = us_triton['triton']
-    err_triton_noquant = checkAllclose(
-        out_ref,
-        triton_fp8_output,
-        atol=fp8_diff_thr,
-        rtol=fp8_diff_thr,
-        msg=f"[torch vs triton_fp8][   Quant]: {us_triton:>8.2f} us......",
-    )
-    compare_arrays(triton_fp8_output.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
-    # compare_arrays(triton_fp8_output.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
-    ret["us_triton_fp8"] = us_triton
-    # ret["err_triton_fp8"] = err_triton_noquant
-    out_ref_md5 = hashlib.md5(out_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    triton_fp8_output_md5 = hashlib.md5(triton_fp8_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    print(f"out_ref_md5={out_ref_md5}")
-    print(f"triton_fp8_output_md5={triton_fp8_output_md5}")
+    if qlen <= 2:
+        triton_fp8_output = torch.empty_like(out_ref_noquant)
+        triton_fp8_output, us_triton = run_triton_fp8(
+            triton_fp8_output,
+            # query,
+            # k_cache,
+            # v_cache,
+            q_quant,
+            k_quant_,
+            v_quant_,
+
+            seq_lens,
+            block_tables,
+            softmax_scale,
+            seq_lens.max().item(),
+            torch_to_tl_dtype[dtype],
+            q_scale=q_scale,
+            k_scale=k_scale_asm,
+            v_scale=v_scale_asm,
+            num_seq_partitions=0,
+            alibi_slopes=None,
+        )
+        us_triton = us_triton['triton']
+        err_triton_noquant = checkAllclose(
+            out_ref,
+            triton_fp8_output,
+            atol=fp8_diff_thr,
+            rtol=fp8_diff_thr,
+            msg=f"[torch vs triton_fp8][   Quant]: {us_triton:>8.2f} us......",
+        )
+        compare_arrays(triton_fp8_output.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+        # compare_arrays(triton_fp8_output.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
+        ret["us_triton_fp8"] = us_triton
+        # ret["err_triton_fp8"] = err_triton_noquant
+        out_ref_md5 = hashlib.md5(out_ref.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+        triton_fp8_output_md5 = hashlib.md5(triton_fp8_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+        print(f"out_ref_md5={out_ref_md5}")
+        print(f"triton_fp8_output_md5={triton_fp8_output_md5}")
 
 
     gluon_fp8_output = torch.empty_like(out_ref_noquant)
@@ -741,7 +743,7 @@ def test_pa_mtp(
     ret["gluon_fp8_bandwith(TB/s)"] = bandwith
 
 
-    if block_size == 16:
+    if block_size == 16 and num_heads != (5, 1):
         out_aiter_asm, us_aiter_asm = run_aiter_asm(
             query,
             k_quant_,
@@ -807,18 +809,19 @@ def test_pa_mtp(
 
 
 head_dim = 128
-block_size_list = [16, 64, 128, 256, 512, 1024]
-# block_size_list = [16, 64, 1024]
+# block_size_list = [16, 64, 128, 256, 512, 1024]
+block_size_list = [16, 64, 1024]
 l_dtype = ["bf16"]
-# l_num_heads = [(5, 1), (8, 1), (10, 1)]
-l_num_heads = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 1), (8, 2)]
-l_qlen = [1, 2]
-# l_qlen = [1, 2, 3, 4]
-l_ctx_len = [7, 26, 57, 66, 109, 128, 256, 257, 282, 512, 513, 4096, 4097]
-# l_ctx_len = [2048, 4096, 8192]
-# l_ctx_len = [8192, 8193, 32768, 32769]
-# l_batch_size = [128, 32]
-l_batch_size = [4, 32, 80, 128]
+# l_num_heads = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 1), (8, 2), (64, 4)]
+# l_num_heads = [(5, 1), (8, 1), (10, 1), (16, 1)]
+l_num_heads = [(8, 1), (10, 1), (16, 1)]
+# l_qlen = [1, 2]
+l_qlen = [1, 2, 3, 4]
+# l_ctx_len = [7, 26, 57, 66, 109, 128, 256, 257, 282, 512, 513, 4096, 4097]
+# l_ctx_len = [512, 2048, 4096, 8192, 4097, 8193]
+l_ctx_len = [4096]
+# l_batch_size = [4, 32, 80, 128]
+l_batch_size = [80, 128]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -920,4 +923,7 @@ for dtype in l_dtype:
                         df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"summary:\n{df}")
-    # df.to_csv("mla_prefill.csv")
+    file_name = "pa_gluon_fp8.csv"
+    if args.trans_v:
+        file_name = "pa_gluon_fp8_trans_v.csv"
+    df.to_csv(file_name)
