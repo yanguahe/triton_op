@@ -131,7 +131,13 @@ function run_triton_op {
     python ./test_pa_mtp.py
     python ./test_pa_mtp.py --trans_v
 
-    # python ./test_pa_mtp.py -n 5,1 -q 3 -c 512 -b 4 --block_size 16
+    # python ./test_pa_mtp.py -n 5,1 -q 3 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 10,1 -q 3 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -q 3 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 5,1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -c 4096 -b 128 --block_size 1024
+    # python ./test_pa_mtp.py -n 10,1 -c 4096 -b 128 --block_size 1024 --trans_v
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
 
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 80 --block_size 16
     # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 16
@@ -152,6 +158,8 @@ function run_triton_op {
     # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 64 --trans_v
 
     # python ./test_pa_mtp.py -n 64,4 -q 1 -c 4096 -b 32 --block_size 16
+    # python ./test_pa_mtp.py -n 64,4 -q 4 -c 4096 -b 32 --block_size 16
+    # python ./test_pa_mtp.py -n 64,4 -q 2 -c 4096 -b 32 --block_size 16
 
 
     # rocprofv3 -i ./counters.yaml --kernel-include-regex "pa_decode_v2_fp8" --output-directory ./rocprofv3_out -- python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16

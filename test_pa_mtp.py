@@ -743,7 +743,8 @@ def test_pa_mtp(
     ret["gluon_fp8_bandwith(TB/s)"] = bandwith
 
 
-    if block_size == 16 and num_heads != (5, 1):
+    if not(block_size == 1024 and num_heads != (10, 1)) and not(block_size == 16 and num_heads == (8, 1) and qlen == 3) \
+        and block_size != 64:
         out_aiter_asm, us_aiter_asm = run_aiter_asm(
             query,
             k_quant_,
@@ -802,6 +803,14 @@ def test_pa_mtp(
     # ret["err_hip_fp8"] = err
 
 
+    if "us_hip_fp8" in ret:
+        ret["perf_fp8_gluon_vs_hip"] = f'{ret["us_hip_fp8"] / ret["us_gluon_fp8"]:.0%}'
+    else:
+        ret["perf_fp8_gluon_vs_hip"] = 'NaN'
+    if "us_asm_fp8" in ret:
+        ret["perf_fp8_gluon_vs_asm"] = f'{ret["us_asm_fp8"] / ret["us_gluon_fp8"]:.0%}'
+    else:
+        ret["perf_fp8_gluon_vs_asm"] = 'NaN'
     print(f"triton={triton}")
     print(f"triton.version={triton.__version__}")
 
@@ -815,8 +824,8 @@ l_dtype = ["bf16"]
 # l_num_heads = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 1), (8, 2), (64, 4)]
 # l_num_heads = [(5, 1), (8, 1), (10, 1), (16, 1)]
 l_num_heads = [(8, 1), (10, 1), (16, 1)]
-# l_qlen = [1, 2, 3, 4]
-l_qlen = [1, 2, 4]
+l_qlen = [1, 2, 3, 4]
+# l_qlen = [1, 2, 4]
 # l_ctx_len = [7, 26, 57, 66, 109, 128, 256, 257, 282, 512, 513, 4096, 4097]
 # l_ctx_len = [512, 2048, 4096, 8192, 4097, 8193]
 l_ctx_len = [4096]
@@ -903,13 +912,13 @@ if args.batch_size is not None:
 if args.block_size is not None:
     block_size_list = [args.block_size]
 
+df = []
 for dtype in l_dtype:
-    df = []
-    for num_heads in l_num_heads:
-        for qlen in l_qlen:
+    for block_size in block_size_list:
+        for num_heads in l_num_heads:
             for ctx_len in l_ctx_len:
                 for batch_size in l_batch_size:
-                    for block_size in block_size_list:
+                    for qlen in l_qlen:
                         ret = test_pa_mtp(
                             ctx_len,
                             batch_size,
@@ -921,9 +930,9 @@ for dtype in l_dtype:
                             args.trans_v,
                         )
                         df.append(ret)
-    df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
-    file_name = "pa_gluon_fp8.csv"
-    if args.trans_v:
-        file_name = "pa_gluon_fp8_trans_v.csv"
-    df.to_csv(file_name)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")
+file_name = "pa_gluon_fp8.csv"
+if args.trans_v:
+    file_name = "pa_gluon_fp8_trans_v.csv"
+df.to_csv(file_name)
