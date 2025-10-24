@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 import triton
+import triton.language as tl
 
 import aiter
 from aiter import dtypes
@@ -22,10 +23,8 @@ from utils import compare_arrays
 # from pa_decode_gluon import paged_attention_decode as paged_attention_decode_gluon
 # from pa_decode_triton import paged_attention_decode as paged_attention_decode_triton
 # from pa_decode_triton_fp8 import paged_attention_decode as paged_attention_decode_triton_fp8
-from pa_decode_triton_fp8_2 import paged_attention_decode as paged_attention_decode_triton_fp8
-# from pa_decode_triton_fp8_gluon import paged_attention_decode as paged_attention_decode_gluon_fp8
-from pa_decode_triton_fp8_gluon_kv_loop import paged_attention_decode as paged_attention_decode_gluon_fp8
-import triton.language as tl
+from pa_decode_triton_fp8 import paged_attention_decode as paged_attention_decode_triton_fp8
+from pa_decode_triton_gluon_fp8 import paged_attention_decode as paged_attention_decode_gluon_fp8
 
 
 # os.environ["TRITON_CACHE_DIR"] = "/home/sijieli2/gluon_cache"
@@ -897,7 +896,7 @@ parser.add_argument(
     "-c",
     "--ctx_len",
     type=int,
-    choices=l_ctx_len,
+    # choices=l_ctx_len,
     default=None,
     help="""Context length.
     e.g. -c 128""",
@@ -906,7 +905,7 @@ parser.add_argument(
     "-b",
     "--batch_size",
     type=int,
-    choices=l_batch_size,
+    # choices=l_batch_size,
     default=None,
     help="""Batch size.
     e.g. -b 128""",
@@ -914,7 +913,7 @@ parser.add_argument(
 parser.add_argument(
     "--block_size",
     type=int,
-    choices=block_size_list,
+    # choices=block_size_list,
     default=None,
     help="""Batch size.
     e.g. --block_size 16""",
