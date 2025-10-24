@@ -6,7 +6,6 @@ from typing import Optional
 import tempfile
 import subprocess
 import os
-import sys
 
 import triton
 import triton.language as tl
@@ -250,7 +249,7 @@ def pa_decode_v2_gluon_big_blk_fp8(
         page_offset = 3 * SEQ_PARTITION_SZ
 
     q_offs_base = (
-        seq_idx * stride_q_s
+        seq_idx * Q_SEQ_LEN * stride_q_s
         + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[:, None]) * stride_q_nh
         + head_sz_offs[None, :]
     )
@@ -261,7 +260,7 @@ def pa_decode_v2_gluon_big_blk_fp8(
     if Q_QUANT_MODE == 0:
         q_scale_val = tl.load(q_scale)
     elif Q_QUANT_MODE == 1:
-        q_scale_offs = seq_idx * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + qk_row_offs[:, None]
+        q_scale_offs = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + qk_row_offs[:, None]
         # [QUERY_GRP_SZ_POW2, 1]
         q_scale_val = gl.amd.cdna3.buffer_load(
             ptr=q_scale, offsets=q_scale_offs, mask=qk_row_offs[:, None] < QUERY_GRP_SZ
@@ -707,7 +706,7 @@ def pa_decode_v2_gluon_fp8(
     seq_part_idx = gl.program_id(2)
 
     q_offs_base = (
-        seq_idx * stride_q_s
+        seq_idx * Q_SEQ_LEN * stride_q_s
         + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[:, None]) * stride_q_nh
         + head_sz_offs[None, :]
     )
@@ -718,7 +717,7 @@ def pa_decode_v2_gluon_fp8(
     if Q_QUANT_MODE == 0:
         q_scale_val = tl.load(q_scale)
     elif Q_QUANT_MODE == 1:
-        q_scale_offs = seq_idx * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + qk_row_offs[:, None]
+        q_scale_offs = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + qk_row_offs[:, None]
         # [QUERY_GRP_SZ_POW2, 1]
         q_scale_val = gl.amd.cdna3.buffer_load(
             ptr=q_scale, offsets=q_scale_offs, mask=qk_row_offs[:, None] < QUERY_GRP_SZ
@@ -1453,7 +1452,6 @@ def paged_attention_decode(
     seq_lens: torch.Tensor,     # [num_seqs]
     block_tables: torch.Tensor, # [num_seqs, max_num_blks_per_seq]
     attn_scale: float,
-    q_seq_len: int,
     max_seq_len: int,
     compute_type,
     q_scale: torch.Tensor,      # [num_seqs, num_kv_heads * query_grp_sz, 1]
@@ -1465,11 +1463,13 @@ def paged_attention_decode(
     """
     #TODO: Add Doc
     """
+    batch_size = block_tables.shape[0]
     num_seqs = query.shape[0]
     num_q_heads = query.shape[1]
-    num_q_heads = num_q_heads // q_seq_len
     num_kv_heads = key_cache.shape[1]
+    q_seq_len = num_seqs // batch_size
     max_num_partitions = int((max_seq_len + _SEQ_PARTITION_SIZE - 1) // _SEQ_PARTITION_SIZE)
+    num_q_heads = query.shape[1]
     head_sz = query.shape[-1]
     kv_blk_sz = key_cache.shape[-2]
     query_grp_sz = num_q_heads // num_kv_heads
@@ -1478,6 +1478,8 @@ def paged_attention_decode(
     kv_blk_sz_pow2 = triton.next_power_of_2(kv_blk_sz)
     head_sz_pow2 = triton.next_power_of_2(head_sz)
     is_causal = q_seq_len > 1
+    # is_causal = False
+    num_seqs = batch_size
     kv_16b_ele_num = 16 // key_cache.dtype.itemsize
 
     grid = (num_seqs, num_kv_heads, max_num_partitions)
@@ -1534,6 +1536,15 @@ def paged_attention_decode(
     if value_cache.dtype == aiter.dtypes.fp8:
         fp8_max = torch.finfo(aiter.dtypes.fp8).max
 
+    output = output.reshape(batch_size, q_seq_len, num_kv_heads, query_grp_sz, head_sz)
+    output = output.transpose(1, 2).reshape(batch_size, num_kv_heads * q_seq_len * query_grp_sz, head_sz).contiguous()
+
+    # qt = query.reshape(batch_size, q_seq_len, num_kv_heads, query_grp_sz, head_sz)
+    # qt = qt.transpose(1, 2).reshape(batch_size, num_kv_heads * q_seq_len * query_grp_sz, head_sz).contiguous()
+
+    # qst = q_scale.reshape(batch_size, q_seq_len, num_kv_heads, query_grp_sz)
+    # qst = qst.transpose(1, 2).reshape(batch_size, num_kv_heads * q_seq_len * query_grp_sz).contiguous()
+
     # print(f"grid={grid}")
     # print(f"shape_info={shape_info}")
     # print(f"query.shape={query.shape}")
@@ -1571,7 +1582,6 @@ def paged_attention_decode(
     #     SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
     # )
     # print(input_config)
-    # sys.stdout.flush()
 
 
     _, decode_time = _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
@@ -1580,12 +1590,14 @@ def paged_attention_decode(
         max_logits,
         tmp_output,
         query,
+        # qt,
         key_cache,
         value_cache,
         block_tables,
         seq_lens,
         attn_scale,
         q_scale,
+        # qst,
         k_scale,
         v_scale,
         alibi_slopes,
@@ -1653,9 +1665,11 @@ def paged_attention_decode(
         MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
         MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
     )
+    output = output.reshape(batch_size, num_kv_heads, q_seq_len, query_grp_sz, head_sz)
+    output = output.transpose(1, 2).reshape(batch_size * q_seq_len, num_kv_heads * query_grp_sz, head_sz).contiguous()
 
-    # tmp_output_nan_cnt = torch.isnan(tmp_output).sum()
-    # output_nan_cnt = torch.isnan(output).sum()
+    tmp_output_nan_cnt = torch.isnan(tmp_output).sum()
+    output_nan_cnt = torch.isnan(output).sum()
     # print(f"tmp_output_nan_cnt={tmp_output_nan_cnt}")
     # print(f"output_nan_cnt={output_nan_cnt}")
 
@@ -1665,7 +1679,6 @@ def paged_attention_decode(
     return {'triton_decode': decode_time,
             'triton_reduce': reduce_time,
             'tmp_output': tmp_output,
-            'output': output,
             'exp_sums': exp_sums,
             'max_logits': max_logits,
             'triton': decode_time + reduce_time}
