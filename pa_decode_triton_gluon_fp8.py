@@ -10,7 +10,6 @@ import sys
 
 import triton
 import triton.language as tl
-from triton.compiler.code_generator import ast_to_ttir
 from triton.compiler.compiler import compile
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -24,10 +23,6 @@ TEST_NUM_ITERS = 101
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 
-# _SEQ_PARTITION_SIZE = 256
-# _SEQ_PARTITION_SIZE = 128
-# _SEQ_PARTITION_SIZE = 1024
-# _SEQ_PARTITION_SIZE = 512
 _SEQ_PARTITION_SIZE = 256
 
 
@@ -100,18 +95,9 @@ def pa_decode_v2_gluon_big_blk_fp8(
         gl.static_assert(k_scale.dtype.element_ty == gl.float32)
         gl.static_assert(v_scale.dtype.element_ty == gl.float32)
 
-    # # 0 for per_tensor quant
-    # # 1 for per_token quant
-    # # Q_QUANT_MODE: gl.constexpr = 0
-    # Q_QUANT_MODE: gl.constexpr = 1
-    # # KV_QUANT_MODE: gl.constexpr = 0
-    # KV_QUANT_MODE: gl.constexpr = 1
-
     log2e: gl.constexpr = 1.4426950408889634
     CONTIGUOUS_KV_ELEMS_16B_LOAD: gl.constexpr = KV_16B_ELE_NUM
     K_HEAD_SZ_POW2_SPLIT: gl.constexpr = HEAD_SZ_POW2 // CONTIGUOUS_KV_ELEMS_16B_LOAD
-    # # KV_COMPUTE_BLOCK_SIZE: gl.constexpr = 128
-    # KV_COMPUTE_BLOCK_SIZE: gl.constexpr = 256
 
     # ==================== Layout Definitions ====================
     blocked_q: gl.constexpr = gl.BlockedLayout(
@@ -121,14 +107,6 @@ def pa_decode_v2_gluon_big_blk_fp8(
         order           =[1, 0],
     )
 
-    # # [K_HEAD_SZ_POW2_SPLIT, KV_COMPUTE_BLOCK_SIZE, CONTIGUOUS_KV_ELEMS_16B_LOAD] x fp8
-    # blocked_k2: gl.constexpr = gl.DistributedLinearLayout(
-    #     reg_bases=((0, 0, 1), (0, 0, 2), (0, 0, 4), (0, 0, 8), (4, 0, 0), (0, 64, 0), (0, 128, 0)),
-    #     lane_bases=((0, 1, 0), (0, 2, 0), (0, 4, 0), (0, 8, 0), (1, 0, 0), (2, 0, 0)),
-    #     warp_bases=((0, 16, 0), (0, 32, 0)),
-    #     block_bases=[],
-    #     shape=[K_HEAD_SZ_POW2_SPLIT, KV_COMPUTE_BLOCK_SIZE, CONTIGUOUS_KV_ELEMS_16B_LOAD],
-    # )
     # [K_HEAD_SZ_POW2_SPLIT, KV_COMPUTE_BLOCK_SIZE, CONTIGUOUS_KV_ELEMS_16B_LOAD] x fp8
     blocked_k2: gl.constexpr = gl.BlockedLayout(
         size_per_thread =[1, 1, 16],
@@ -186,15 +164,6 @@ def pa_decode_v2_gluon_big_blk_fp8(
         v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout)))
         v_dim2_offs = gl.arange(0, CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_v_layout)))
     else:
-        # # [HEAD_SZ_POW2, KV_COMPUTE_BLOCK_SIZE]
-        # blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout(
-        #     # reg_bases=((0, 1), (0, 2), (0, 4), (0, 8), (64, 0), (0, 64), (0, 128)),
-        #     reg_bases=((0, 1), (0, 2), (0, 4), (0, 8), (0, 64), (0, 128), (64, 0)),
-        #     lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 16), (0, 32)),
-        #     warp_bases=((16, 0), (32, 0)),
-        #     block_bases=[],
-        #     shape=[HEAD_SZ_POW2, KV_COMPUTE_BLOCK_SIZE],
-        # )
         # [HEAD_SZ_POW2, KV_COMPUTE_BLOCK_SIZE]
         blocked_v_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread =[1, 16],
@@ -312,7 +281,6 @@ def pa_decode_v2_gluon_big_blk_fp8(
 
         blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
         kv_page_id = tl.load(blk_tables_start_ptr + blk_tb_id)
-        # tl.static_print(kv_page_id.type)
 
         # k_blk_offs[K_HEAD_SZ_POW2_SPLIT, KV_COMPUTE_BLOCK_SIZE, CONTIGUOUS_KV_ELEMS_16B_LOAD]
         k_blk_offs = (
@@ -419,7 +387,6 @@ def pa_decode_v2_gluon_big_blk_fp8(
         if v.dtype.is_fp8():
             # 1 for per_token quant
             if KV_QUANT_MODE == 1:
-                # vs_1d = gl.reshape(v_scale_val, [KV_COMPUTE_BLOCK_SIZE])
                 vs_max = gl.max(v_scale_val, axis=0)
                 v_scale_val = v_scale_val * float(FP8_MAX) / vs_max
                 p = v_scale_val[None, :] * p
@@ -533,21 +500,6 @@ def pa_decode_v2_gluon_fp8(
     if KV_QUANT_MODE >= 0:
         gl.static_assert(k_scale.dtype.element_ty == gl.float32)
         gl.static_assert(v_scale.dtype.element_ty == gl.float32)
-    # gl.static_print(k_cache_ptr.dtype)
-    # tl.static_print(k_cache_ptr.dtype.element_ty)
-    # tl.static_print(gl.float8e4b8)
-    # tl.static_print(k_cache_ptr.dtype.element_ty == gl.float8e4b8)
-    # tl.static_print(q_scale.dtype.element_ty == gl.float32)
-
-    # # 0 for per_tensor quant
-    # # 1 for per_token quant
-    # # Q_QUANT_MODE: gl.constexpr = 0
-    # Q_QUANT_MODE: gl.constexpr = 1
-    # # KV_QUANT_MODE: gl.constexpr = 0
-    # KV_QUANT_MODE: gl.constexpr = 1
-
-    # # KV_COMPUTE_BLOCK_SIZE: gl.constexpr = 128
-    # KV_COMPUTE_BLOCK_SIZE: gl.constexpr = 256
 
     log2e: gl.constexpr = 1.4426950408889634
     CONTIGUOUS_KV_ELEMS_16B_LOAD: gl.constexpr = KV_16B_ELE_NUM
@@ -561,36 +513,14 @@ def pa_decode_v2_gluon_fp8(
         warps_per_cta   =[4, 1],
         order           =[1, 0],
     )
-    # MAX_NUM_KV_BLKS x K_HEAD_SZ_POW2_SPLIT x KV_BLK_SZ x CONTIGUOUS_KV_ELEMS_16B_LOAD
-    # 16 x 16 x 16 x 8 x fp16
-    blocked_k1: gl.constexpr = gl.DistributedLinearLayout( # fp16
-        reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,0,1,0), (0,1,0,0), (0,8,0,0), (8,0,0,0)), # 16 x 8
-        lane_bases=((0,0,2,0), (0,0,4,0), (0,0,8,0), (1,0,0,0), (0,2,0,0), (0,4,0,0)), # 64
-        warp_bases=((2,0,0,0), (4,0,0,0)), # 4
-        block_bases=[], # 8
-        shape=[MAX_NUM_KV_BLKS, 16, 16, 8],
-    )
-    # 16 x 8 x 16 x 16 x fp8
-    # blocked_k2: gl.constexpr = gl.DistributedLinearLayout( # fp8
-    #     reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,0,0,8), (0,0,1,0), (0,4,0,0), (8,0,0,0)), # 16 x 8
-    #     lane_bases=((0,0,2,0), (0,0,4,0), (0,0,8,0), (1,0,0,0), (0,1,0,0), (0,2,0,0)), # 64
-    #     warp_bases=((2,0,0,0), (4,0,0,0)), # 4
-    #     block_bases=[], # 8
-    #     shape=[MAX_NUM_KV_BLKS, 8, 16, 16],
-    # )
-    # blocked_k2: gl.constexpr = gl.BlockedLayout(
-    #     size_per_thread =[1, 1, 2, 16],
-    #     threads_per_warp=[2, 4, 8, 1],
-    #     warps_per_cta   =[4, 1, 1, 1],
-    #     order           =[3, 2, 0, 1],
-    # )
+
     blocked_k2: gl.constexpr = gl.BlockedLayout(
         size_per_thread =[1, 1, 1, 16],
         threads_per_warp=[1, 4, 16, 1],
         warps_per_cta   =[4, 1, 1, 1],
         order           =[3, 2, 1, 0],
     )
-    blocked_k: gl.constexpr = blocked_k1 if CONTIGUOUS_KV_ELEMS_16B_LOAD == 8 else blocked_k2
+    blocked_k: gl.constexpr = blocked_k2
 
     # transposed: indicates the result tensor is transposed so that each thread holds consecutive elements
     # in the same row instead of column, which is good for chained dot and global write.
@@ -603,13 +533,6 @@ def pa_decode_v2_gluon_fp8(
     qk_rhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=qk_mfma_layout, k_width=16
     )
-    # qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
-    #     reg_bases=((0,1), (0,2), (0,4), (0,128)), # 16 x 8
-    #     lane_bases=((1,0), (2,0), (4,0), (8,0), (0,8), (0,16)), # 64
-    #     warp_bases=((0,32), (0,64)), # 4
-    #     block_bases=[], # 8
-    #     shape=[16, KV_COMPUTE_BLOCK_SIZE],
-    # )
 
     if QUERY_GRP_SZ_POW2 == 16:
         if KV_COMPUTE_BLOCK_SIZE == 128:
@@ -634,13 +557,6 @@ def pa_decode_v2_gluon_fp8(
         block_bases=[],
         shape=[QUERY_GRP_SZ_POW2, KV_COMPUTE_BLOCK_SIZE],
     )
-    # # Layout mismatch with qk_linear_layout
-    # qk_linear_layout: gl.constexpr = gl.BlockedLayout(
-    #     size_per_thread =[1, 4],
-    #     threads_per_warp=[16, 4],
-    #     warps_per_cta   =[1, 4],
-    #     order           =[0, 1],
-    # )
 
     if TRANS_V:
         # [MAX_NUM_KV_BLKS, 1, 128, 16]
@@ -654,13 +570,6 @@ def pa_decode_v2_gluon_fp8(
         v_dim2_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, blocked_v_layout))))
         v_dim3_offs = gl.arange(0, CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout))))
     else:
-        # blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout( # 256x128
-        #     reg_bases=((0,0,1), (0,0,2), (0,0,4), (0,0,8), (4,0,0), (8,0,0), (0,64,0)), # 16 x 8
-        #     lane_bases=((0,1,0), (0,2,0), (0,4,0), (0,8,0), (1,0,0), (2,0,0)), # 64
-        #     warp_bases=((0,16,0), (0,32,0)), # 4
-        #     block_bases=[], # 8
-        #     shape=[MAX_NUM_KV_BLKS, 128, 16],
-        # )
         # [MAX_NUM_KV_BLKS, 128, 16]
         blocked_v_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread =[1, 1, 16],
@@ -743,12 +652,8 @@ def pa_decode_v2_gluon_fp8(
         + o_head_sz_offs[None, :]
     )
 
-    # m_i = gl.zeros((QUERY_GRP_SZ_POW2,), dtype=gl.float32, layout=gl.SliceLayout(1, qk_linear_layout))
-    # m_i = gl.zeros((QUERY_GRP_SZ_POW2,), dtype=gl.float32)
-    # m_i = gl.convert_layout(m_i, layout=gl.SliceLayout(1, qk_linear_layout))
     m_i = m_l_base_offs.to(gl.float32) * float(0.0) - float("inf")
     l_i = m_l_base_offs.to(gl.float32) * float(0.0)
-    # acc0 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=COMPUTE_TYPE, layout=pv_mfma_layout)
     acc0 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
 
 
@@ -757,7 +662,6 @@ def pa_decode_v2_gluon_fp8(
     if kv_seq_start_idx >= kv_seq_len:
         return
     KV_COMPUTE_BLOCK_NUM: gl.constexpr = SEQ_PARTITION_SZ // KV_COMPUTE_BLOCK_SIZE
-    # seq_end_idx = gl.minimum(kv_seq_start_idx + SEQ_PARTITION_SZ, kv_seq_len)
     SEQ_PARTITION_NUM_KV_BLKS: gl.constexpr = SEQ_PARTITION_SZ // KV_BLK_SZ
 
     for kv_idx in range(KV_COMPUTE_BLOCK_NUM):
@@ -840,18 +744,9 @@ def pa_decode_v2_gluon_fp8(
             v = gl.reshape(v, [KV_COMPUTE_BLOCK_SIZE, HEAD_SZ_POW2])
 
 
-        # accumulator0 = gl.zeros((QUERY_GRP_SZ_POW2, KV_COMPUTE_BLOCK_SIZE // 2), dtype=gl.float32, layout=qk_mfma_layout)
-        # accumulator1 = gl.zeros((QUERY_GRP_SZ_POW2, KV_COMPUTE_BLOCK_SIZE // 2), dtype=gl.float32, layout=qk_mfma_layout)
         accumulator = gl.zeros((QUERY_GRP_SZ_POW2, KV_COMPUTE_BLOCK_SIZE), dtype=gl.float32, layout=qk_mfma_layout)
 
 
-        # qc = gl.convert_layout(q, layout=qk_lhs_layout)
-        # kc0 = gl.convert_layout(kt0, layout=qk_rhs_layout)
-        # kc1 = gl.convert_layout(kt1, layout=qk_rhs_layout)
-        # qk0 = gl.amd.cdna3.mfma(qc, kc0, accumulator0)
-        # qk1 = gl.amd.cdna3.mfma(qc, kc1, accumulator1)
-        # qk = gl.join(qk0, qk1)
-        # qk = gl.reshape(qk, [QUERY_GRP_SZ_POW2, KV_COMPUTE_BLOCK_SIZE])
         qc = gl.convert_layout(q, layout=qk_lhs_layout)
         kc = gl.convert_layout(k, layout=qk_rhs_layout)
         qk = gl.amd.cdna3.mfma(qc, kc, accumulator)
@@ -919,10 +814,7 @@ def pa_decode_v2_gluon_fp8(
 
         # acc_scale = l_i * 0 + alpha  # Workaround some compiler bug
         acc_scale = gl.convert_layout(acc_scale[:, None], layout=pv_mfma_layout)
-        # p_scale = gl.convert_layout(p_scale[:, None], layout=pv_mfma_layout)
         acc0 *= acc_scale
-        # acc0 = gl.amd.cdna3.mfma(pc, vc, acc0)
-        # acc0 = p_scale * acc0
         accumulator1 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
         acc = gl.amd.cdna3.mfma(pc, vc, accumulator1)
 
@@ -1010,7 +902,6 @@ def paged_attn_decode_v2_reduce_gluon(
 
     # max_logits: [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2]
     max_logits = gl.amd.cdna3.buffer_load(
-        # ptr=max_logits_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=float("-inf")
         ptr=max_logits_ptr, offsets=exp_sums_offs, mask=exp_sums_mask
     )
     # max_logit: [QUERY_GRP_SZ_POW2]
@@ -1018,7 +909,6 @@ def paged_attn_decode_v2_reduce_gluon(
 
     # Rescale the exp sums and compute the global sum
     # exp_sums: [MAX_NUM_SEQ_PARTITIONS, QUERY_GRP_SZ_POW2]
-    # exp_sums = gl.amd.cdna3.buffer_load(ptr=exp_sums_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=0.0)
     exp_sums = gl.amd.cdna3.buffer_load(ptr=exp_sums_ptr, offsets=exp_sums_offs, mask=exp_sums_mask)
     exp_sums *= tl.exp(max_logits - ml[None, :])
 
@@ -1047,7 +937,6 @@ def paged_attn_decode_v2_reduce_gluon(
         q_grp_offs[None, :] < QUERY_GRP_SZ
     )
     logits = gl.amd.cdna3.buffer_load(
-        # ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None], other=0.0
         ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None]
     )
 
@@ -1059,7 +948,6 @@ def paged_attn_decode_v2_reduce_gluon(
         + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[None, :, None]) * stride_o_h
         + head_offs[None, None, :]
     )
-    # gl.static_print(out_offs)
     gl.amd.cdna3.buffer_store(
         stored_value=out,
         ptr=out_ptr,
@@ -1129,8 +1017,6 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     # exp_sums: [MAX_NUM_SEQ_PARTITIONS, QUERY_GRP_SZ_POW2]
     exp_sums = tl.load(exp_sums_ptr + exp_sums_offs, mask=exp_sums_mask)
     exp_sums *= tl.exp(max_logits - ml[None, :])
-    # exp_sums *= tl.exp2(max_logits - ml[None, :])
-    # exp_sums *= tl.exp2((max_logits - ml[None, :]) * log2e)
 
     # exp_sum: [QUERY_GRP_SZ_POW2]
     exp_sum = tl.sum(exp_sums, axis=0)
@@ -1187,7 +1073,6 @@ def compile_ttgir_with_triton(ttgir_content: str):
 
 
 @perftest()
-# @perftest(num_iters=TEST_NUM_ITERS)
 def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     grid,
     exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -1241,14 +1126,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     TRANS_V,
     IS_CAUSAL,
 ):
-    # import pdb
-    # pdb.set_trace()
-
-    # if 1:
     if 0:
-        # ttgir_file_path = os.path.join(os.path.dirname(__file__), "./ttgir/pa_noloop.ttgir")
         ttgir_file_path = os.path.join(os.path.dirname(__file__), "./thread_trace/triton_gen_asm/pa_decode_v2_fp8/pa_decode_v2_fp8.ttgir")
-        # ttgir_file_path = os.path.join(os.path.dirname(__file__), "./thread_trace/triton_gen_asm/pa_decode_v2_fp8_rtn/pa_decode_v2_fp8.ttgir")
         with open(ttgir_file_path, 'r') as f:
             ttgir_content = f.read()
         try:
@@ -1357,12 +1236,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             IS_CAUSAL=IS_CAUSAL,
 
             waves_per_eu=waves_per_eu,
-            # waves_per_eu=1,
             num_stages=1,
-            # waves_per_eu=3,
-            # num_stages=1,
-            # waves_per_eu=4,
-            # num_stages=1,
         )
 
 
@@ -1391,7 +1265,6 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
     MAX_NUM_SEQ_PARTITIONS,
     MAX_NUM_SEQ_PARTITIONS_POW2,
 ):
-    # REDUCE_USE_GLUON = True
     REDUCE_USE_GLUON = False
     if REDUCE_USE_GLUON:
         paged_attn_decode_v2_reduce_gluon[grid](
@@ -1484,9 +1357,7 @@ def paged_attention_decode(
     shape_info = (num_seqs, num_kv_heads, max_num_partitions, equi_query_grp_sz)
     max_logits = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
     exp_sums = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
-    # tmp_output = torch.empty(
     tmp_output = torch.zeros(
-        # *shape_info, head_sz, dtype=torch.float8_e4m3fnuz, device=output.device
         *shape_info, head_sz, dtype=output.dtype, device=output.device
     )
 
@@ -1533,46 +1404,6 @@ def paged_attention_decode(
     fp8_max = 1.0
     if value_cache.dtype == aiter.dtypes.fp8:
         fp8_max = torch.finfo(aiter.dtypes.fp8).max
-
-    # print(f"grid={grid}")
-    # print(f"shape_info={shape_info}")
-    # print(f"query.shape={query.shape}")
-    # print(f"q_scale.shape={q_scale.shape}")
-    # print(f"k_scale.shape={k_scale.shape}")
-    # print(f"v_scale.shape={v_scale.shape}")
-    # print(f"key_cache.shape={key_cache.shape}")
-    # print(f"value_cache.shape={value_cache.shape}")
-    # print(f"output.shape={output.shape}")
-    # print(f"tmp_output.shape={tmp_output.shape}")
-    # print(f"block_tables.shape={block_tables.shape}")
-    # print(f"query.dtype={query.dtype}")
-    # print(f"key_cache.dtype={key_cache.dtype}")
-    # print(f"value_cache.dtype={value_cache.dtype}")
-    # print(f"output.dtype={output.dtype}")
-    # print(f"tmp_output.dtype={tmp_output.dtype}")
-    # print(f"block_tables.dtype={block_tables.dtype}")
-    # print(f"value_cache.stride()={value_cache.stride()}")
-    # print(f"query.stride()={query.stride()}")
-    # print(f"q_scale.stride()={q_scale.stride()}")
-    # print(f"k_scale.stride()={k_scale.stride()}")
-    # print(f"v_scale.stride()={v_scale.stride()}")
-    # print(f"tmp_output.stride()={tmp_output.stride()}")
-    # input_config = dict(
-    #     q_seq_len=q_seq_len,
-    #     kv_type=compute_type,
-    #     COMPUTE_TYPE=compute_type,
-    #     HEAD_SZ=head_sz,
-    #     HEAD_SZ_POW2=head_sz_pow2,
-    #     QUERY_GRP_SZ_ORI=query_grp_sz,
-    #     QUERY_GRP_SZ=equi_query_grp_sz,
-    #     QUERY_GRP_SZ_POW2=equi_query_grp_sz_pow2,
-    #     KV_BLK_SZ=kv_blk_sz,
-    #     KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-    #     SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-    # )
-    # print(input_config)
-    # sys.stdout.flush()
-
 
     _, decode_time = _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         grid,
@@ -1653,14 +1484,6 @@ def paged_attention_decode(
         MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
         MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
     )
-
-    # tmp_output_nan_cnt = torch.isnan(tmp_output).sum()
-    # output_nan_cnt = torch.isnan(output).sum()
-    # print(f"tmp_output_nan_cnt={tmp_output_nan_cnt}")
-    # print(f"output_nan_cnt={output_nan_cnt}")
-
-    # decode_time = 0
-    # reduce_time = 0
 
     return {'triton_decode': decode_time,
             'triton_reduce': reduce_time,
