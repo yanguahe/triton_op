@@ -537,26 +537,26 @@ def test_pa_mtp(
     )
 
 
-    # out_hip_noquant, us_hip = run_aiter_hip(
-    #     query,
-    #     k_cache,
-    #     v_cache,
-    #     block_tables,
-    #     seq_lens,
-    #     ctx_lens,
-    #     max_qlen,
-    #     "auto",
-    #     num_kv_heads,
-    #     softmax_scale,
-    # )
-    # err_hip_noquant = checkAllclose(
-    #     out_ref_noquant,
-    #     out_hip_noquant,
-    #     msg=f"[torch vs aiter_hip][No Quant]: {us_hip:>8.2f} us......",
-    # )
-    # compare_arrays(out_hip_noquant.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
-    # ret["us_hip_bf16"] = us_hip
-    # # ret["err_hip_bf16"] = err_hip_noquant
+    out_hip_noquant, us_hip = run_aiter_hip(
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        ctx_lens,
+        max_qlen,
+        "auto",
+        num_kv_heads,
+        softmax_scale,
+    )
+    err_hip_noquant = checkAllclose(
+        out_ref_noquant,
+        out_hip_noquant,
+        msg=f"[torch vs aiter_hip][No Quant]: {us_hip:>8.2f} us......",
+    )
+    compare_arrays(out_hip_noquant.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
+    ret["us_hip_bf16"] = us_hip
+    # ret["err_hip_bf16"] = err_hip_noquant
 
 
     # triton_output = torch.empty_like(out_ref_noquant)
@@ -770,7 +770,9 @@ def test_pa_mtp(
     ret["gluon_fp8_bandwith(TB/s)"] = bandwith
 
 
-    if not(block_size == 1024 and num_heads != (10, 1)) and not(block_size == 16 and num_heads == (8, 1) and qlen == 3) \
+    query_grp_sz = num_query_heads // num_kv_heads
+    if not(block_size == 1024 and num_heads != (10, 1)) and not(block_size == 16 and query_grp_sz == 8 and qlen == 3) \
+        and not(ctx_lens == 512 and query_grp_sz == 5 and qlen == 3) \
         and block_size != 64:
         out_aiter_asm, us_aiter_asm = run_aiter_asm(
             query,
@@ -801,33 +803,33 @@ def test_pa_mtp(
         ret["asm_fp8_bandwith(TB/s)"] = bandwith
 
 
-    # q_scale = q_scale.squeeze(-1)
-    # out_hip, us_hip = run_aiter_hip(
-    #     # q_quant.to(torch.bfloat16),
-    #     query,
-    #     k_quant_,
-    #     v_quant_,
-    #     block_tables,
-    #     seq_lens,
-    #     ctx_lens,
-    #     max_qlen,
-    #     "fp8",
-    #     num_kv_heads,
-    #     softmax_scale,
-    #     k_scale_asm,
-    #     v_scale_asm,
-    #     q_scale,
-    # )
-    # err = checkAllclose(
-    #     out_ref,
-    #     out_hip,
-    #     atol=fp8_diff_thr,
-    #     rtol=fp8_diff_thr,
-    #     msg=f"[torch vs aiter_hip_fp8][   Quant]: {us_hip:>8.2f} us......",
-    # )
-    # compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
-    # ret["us_hip_fp8"] = us_hip
-    # # ret["err_hip_fp8"] = err
+    q_scale = q_scale.squeeze(-1)
+    out_hip, us_hip = run_aiter_hip(
+        # q_quant.to(torch.bfloat16),
+        query,
+        k_quant_,
+        v_quant_,
+        block_tables,
+        seq_lens,
+        ctx_lens,
+        max_qlen,
+        "fp8",
+        num_kv_heads,
+        softmax_scale,
+        k_scale_asm,
+        v_scale_asm,
+        q_scale,
+    )
+    err = checkAllclose(
+        out_ref,
+        out_hip,
+        atol=fp8_diff_thr,
+        rtol=fp8_diff_thr,
+        msg=f"[torch vs aiter_hip_fp8][   Quant]: {us_hip:>8.2f} us......",
+    )
+    compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
+    ret["us_hip_fp8"] = us_hip
+    # ret["err_hip_fp8"] = err
 
 
     if "us_hip_fp8" in ret:
@@ -851,12 +853,12 @@ block_size_list = [16, 64, 1024]
 l_dtype = ["bf16"]
 # l_num_heads = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 1), (8, 2), (64, 4)]
 # l_num_heads = [(5, 1), (8, 1), (10, 1), (16, 1)]
-l_num_heads = [(8, 1), (10, 1), (16, 1), (64, 4)]
+l_num_heads = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 4)]
 l_qlen = [1, 2, 3, 4]
 # l_qlen = [1, 2, 4]
 # l_ctx_len = [7, 26, 57, 66, 109, 128, 256, 257, 282, 512, 513, 4096, 4097]
 # l_ctx_len = [512, 1024, 2048, 4096, 8192, 2049, 4097, 8193]
-l_ctx_len = [4096, 4097]
+l_ctx_len = [512, 4096, 4097]
 # l_batch_size = [4, 32, 80, 128, 160, 256, 512]
 l_batch_size = [4, 80, 128]
 

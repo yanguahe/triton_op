@@ -132,13 +132,14 @@ function run_triton_op {
     python ./test_pa_mtp.py --trans_v
 
 
+    # python ./test_pa_mtp.py -q 1 -c 4096 -b 128 --block_size 64
     # python ./test_pa_mtp.py -n 10,1 -q 1 -c 4096 -b 80 --block_size 1024
-    # python ./test_pa_mtp.py -n 5,1 -q 3 -c 4096 -b 128 --block_size 16
     # python ./test_pa_mtp.py -n 16,1 -q 3 -c 4096 -b 128 --block_size 16
-    # python ./test_pa_mtp.py -n 5,1 -c 4096 -b 128 --block_size 16
-    # python ./test_pa_mtp.py -n 16,1 -c 4096 -b 128 --block_size 1024
-    # python ./test_pa_mtp.py -n 10,1 -c 4096 -b 128 --block_size 1024 --trans_v
     # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -c 4096 -b 128 --block_size 1024
+    # python ./test_pa_mtp.py -n 5,1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 5,1 -q 3 -c 4096 -b 4 --block_size 16
+    # python ./test_pa_mtp.py -n 10,1 -c 4096 -b 128 --block_size 1024 --trans_v
     # python ./test_pa_mtp.py -n 10,1 --block_size 1024 --trans_v
 
     # python ./test_pa_mtp.py -n 10,1 -c 4096 -b 128 --block_size 16
@@ -149,14 +150,23 @@ function run_triton_op {
     # python ./test_pa_mtp.py -n 8,1 -c 4096 -b 128 --block_size 1024 --trans_v
 
 
-    # python ./test_pa_mtp.py -n 64,4 -q 1 -c 4096 -b 32 --block_size 16
-    # python ./test_pa_mtp.py -n 64,4 -q 2 -c 4096 -b 32 --block_size 16
-    # python ./test_pa_mtp.py -n 64,4 -q 4 -c 4097 -b 32 --block_size 16
-    # python ./test_pa_mtp.py -n 8,1 -q 3 -c 4096 -b 32 --block_size 16
-    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 1024 --trans_v
+    # python ./test_pa_mtp.py -n 64,4 -q 1 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 64,4 -q 2 -c 4096 -b 128 --block_size 64
+    # python ./test_pa_mtp.py -n 64,4 -q 3 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 64,4 -q 4 -c 4097 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 16,1 -q 1 -c 4096 -b 128 --block_size 64
+    # python ./test_pa_mtp.py -n 16,1 -q 3 -c 4096 -b 128 --block_size 1024
+    # python ./test_pa_mtp.py -n 10,1 -q 3 -c 4096 -b 128 --block_size 1024
+    # python ./test_pa_mtp.py -n 10,1 -q 1 -c 4096 -b 128 --block_size 1024 --trans_v
+    # python ./test_pa_mtp.py -n 8,1 -q 3 -c 4096 -b 128 --block_size 16
+    # python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 128 --block_size 64 --trans_v
     # python ./test_pa_mtp.py -n 8,1 -q 3 -c 4097 -b 128 --block_size 1024 --trans_v
     # python ./test_pa_mtp.py -n 5,1 -q 3 -c 4097 -b 128 --block_size 1024 --trans_v
-    # python ./test_pa_mtp.py -n 5,1 -q 1 -c 4096 -b 32 --block_size 16
+    # python ./test_pa_mtp.py -n 5,1 -q 1 -c 4096 -b 128 --block_size 16
+
+
+    # suffix=base && cp logx logx.$suffix && cat logx.$suffix | egrep "diff.abs.max|max_diff_thr|triton_output_md5|gluon_fp8_output_md5" > logs.$suffix && cat logx.$suffix | egrep "us_gluon_fp8" -A 1 >> logs.$suffix
+    # suffix=v1 && cp logx logx.$suffix && cat logx.$suffix | egrep "diff.abs.max|max_diff_thr|triton_output_md5|gluon_fp8_output_md5" > logs.$suffix && cat logx.$suffix | egrep "us_gluon_fp8" -A 1 >> logs.$suffix
 
 
     # rocprofv3 -i ./counters.yaml --kernel-include-regex "pa_decode_v2_fp8" --output-directory ./rocprofv3_out -- python ./test_pa_mtp.py -n 8,1 -q 1 -c 4096 -b 32 --block_size 16
@@ -167,6 +177,8 @@ function run_triton_op {
     # md5sum ~/.triton/cache/*/*.hsaco
 
     copy_recent_amdgcn_files
+
+    cp logx perf.result_v1
 }
 
 
@@ -272,7 +284,6 @@ function get_triton_pa_thread_trace {
 run_triton_op
 # run_aiter_op
 # get_triton_pa_thread_trace
-
 
 
 # KERNEL=kernel
