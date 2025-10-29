@@ -1109,7 +1109,7 @@ def paged_attention_decode_v2_reduce_gluon(
     )
     
     # Rescale exponential sums for numerical stability using global maximum
-    exp_sums *= gl.math.exp(max_logits - global_max_logits[None, :])
+    exp_sums *= gl.exp(max_logits - global_max_logits[None, :])
 
     # Compute global exponential sum across all partitions [QUERY_GROUP_SIZE_POW2]
     global_exp_sum = gl.sum(exp_sums, axis=0)
@@ -1290,14 +1290,14 @@ def paged_attention_decode_v2_reduce_kernel(
     logits_offsets = (
         sequence_idx * stride_logits_seq
         + kv_head_idx * stride_logits_head
-        + partition_offsets[:, None, None] * stride_logits_part
-        + query_group_offsets[None, :, None] * stride_logits_group
+        + partition_offsets[None, :, None] * stride_logits_part
+        + query_group_offsets[:, None, None] * stride_logits_group
         + head_size_offsets[None, None, :]
     )
     
     # Create mask for valid logits access
-    logits_mask = (partition_offsets[:, None] < num_partitions) & (
-        query_group_offsets[None, :] < QUERY_GROUP_SIZE
+    logits_mask = (partition_offsets[None, :] < num_partitions) & (
+        query_group_offsets[:, None] < QUERY_GROUP_SIZE
     )
     
     # Load partial logits from all partitions
@@ -1305,6 +1305,8 @@ def paged_attention_decode_v2_reduce_kernel(
         logits_ptr + logits_offsets, 
         mask=logits_mask[:, :, None]
     )
+
+    partial_logits = tl.permute(partial_logits, (1, 0, 2))
 
     # Compute weighted sum of logits to produce final output [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     final_output = tl.sum(
